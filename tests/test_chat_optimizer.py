@@ -44,7 +44,7 @@ def test_responses_api_compresses_function_output_only():
     }
     original = deepcopy(body)
 
-    optimized, stats = ChatPayloadOptimizer().optimize_body(body)
+    optimized, stats = ChatPayloadOptimizer().optimize_body(body, enabled=True)
 
     assert stats.tokens_saved > 0
     assert any(change.path == "input[3].output" for change in stats.changes)

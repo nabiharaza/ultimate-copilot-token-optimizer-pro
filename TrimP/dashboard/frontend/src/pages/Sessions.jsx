@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { CalendarDays, ChevronLeft, ChevronRight, Download, Filter, MessageSquare, MoreVertical, Search, SlidersHorizontal, Sparkles, Tag, X } from 'lucide-react'
+import { Activity, CalendarDays, ChevronLeft, ChevronRight, Download, Filter, MessageSquare, MoreVertical, Search, SlidersHorizontal, Sparkles, Tag, X } from 'lucide-react'
 import { Loading } from '../components/Charts.jsx'
 
 const PERIODS = [
@@ -65,12 +65,17 @@ export default function Sessions({ onNavigate }) {
   const [page, setPage] = useState(1)
   const [expanded, setExpanded] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [agentRows, setAgentRows] = useState([])
 
   async function load() {
     setLoading(true)
     try {
-      const response = await fetch(`/api/copilot/conversations?range=${period}&limit=500`)
+      const [response, agentResponse] = await Promise.all([
+        fetch(`/api/copilot/conversations?range=${period}&limit=500`),
+        fetch(`/api/agent-logs/sessions?range=${period}&limit=100`),
+      ])
       if (response.ok) setRows(await response.json())
+      if (agentResponse.ok) setAgentRows(await agentResponse.json())
     } finally {
       setLoading(false)
     }
@@ -149,6 +154,8 @@ export default function Sessions({ onNavigate }) {
         <SummaryCard icon={SlidersHorizontal} label="Token Reduction" value={`${totals.reduction.toFixed(2)}%`} sub="average reduction" />
         <SummaryCard icon={Tag} label="Estimated Cost Saved" value={formatMoney(totals.dollars)} sub="total saved" />
       </section>
+
+      <section className="agent-log-table-card"><header><div><div className="conversation-kicker"><Activity size={14} /> Exact upstream usage</div><h2>GitHub Copilot Agent Debug Logs</h2><p>Session snapshots imported from local <code>events.jsonl</code> files. Cached input, output, turns, tools, and totals are reported by Copilot.</p></div><span className="usage-source-badge reported">{agentRows.length} sessions</span></header><div className="agent-log-table-wrap"><table className="agent-log-table"><thead><tr><th>Time</th><th>Repository</th><th>Model</th><th>Input</th><th>Cached</th><th>Output</th><th>Total</th><th>Turns</th><th>Tools</th><th>Errors</th></tr></thead><tbody>{agentRows.map(row => <tr key={row.source_session_id}><td><b>{formatDate(row.event_end)}</b><small>{formatTime(row.event_end)}</small></td><td><b>{row.repository || row.cwd || 'Unknown repository'}</b><small>{row.source_session_id}</small></td><td><span className="model-pill">{modelName(row.model)}</span></td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.cached_input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td className="saved-value">{formatNumber(row.total_tokens)}</td><td>{formatNumber(row.model_turns)}</td><td>{formatNumber(row.tool_calls)}</td><td>{formatNumber(row.errors)}</td></tr>)}</tbody></table>{!agentRows.length && <div className="conversation-empty">No local agent usage snapshots found for this period.</div>}</div></section>
 
       <section className="conversation-table-card">
         <table className="conversation-browser-table">

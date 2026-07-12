@@ -7,42 +7,51 @@ import Config from './pages/Config.jsx'
 import Repositories from './pages/Repositories.jsx'
 import Sessions from './pages/Sessions.jsx'
 import CopilotOptimizer from './pages/CopilotOptimizer.jsx'
+import OverviewDashboard from './pages/OverviewDashboard.jsx'
 import SystemDesign from './pages/SystemDesign.jsx'
 import TrimPolicy from './pages/TrimPolicy.jsx'
 import DiffReview from './pages/DiffReview.jsx'
 import Feedback from './pages/Feedback.jsx'
 import LiveTest from './pages/LiveTest.jsx'
+import Alerts from './pages/Alerts.jsx'
 
 export default function App() {
   // Persistent page state (survives refresh)
   const [page, setPage] = useState(() => {
     return localStorage.getItem('TrimP_current_page') || 'home'
   })
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('TrimP_sidebar_collapsed') === 'true')
 
   // Save page to localStorage on change
   useEffect(() => {
     localStorage.setItem('TrimP_current_page', page)
   }, [page])
 
+  useEffect(() => {
+    localStorage.setItem('TrimP_sidebar_collapsed', String(sidebarCollapsed))
+  }, [sidebarCollapsed])
+
   const pages = { 
-    home: CopilotOptimizer, 
-    optimize: CopilotOptimizer,
+    home: OverviewDashboard,
+    optimize: OverviewDashboard,
     system: SystemDesign,
     policy: TrimPolicy,
     diff: DiffReview,
     demo: LiveTest,
     activity: Repositories,
+    live: CompressionLive,
     sessions: Sessions,
     savings: Savings, 
     settings: Config,
     feedback: Feedback,
+    alerts: Alerts,
   }
   
   const Page = pages[page] || HomeNew
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)' }}>
-      <Sidebar active={page} onNavigate={setPage} />
+    <div className={`app-shell ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
+      <Sidebar active={page} onNavigate={setPage} collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(value => !value)} />
       <div className="main-content" style={{ flex: 1, overflowY: 'auto' }}>
         <Page onNavigate={setPage} />
       </div>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import webbrowser
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 
 from TrimP.db import db, get_config, DB_PATH
 from TrimP.chat_optimizer import ChatPayloadOptimizer, estimate_tokens
+from TrimP.copilot_logs import discover_events_files, parse_events_file
 from TrimP.quality import score_session
 from TrimP.session import get_or_create_session, get_recent_sessions
 
@@ -33,6 +35,8 @@ app.add_middleware(
 )
 
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
+
+_AGENT_LOG_CACHE: dict[str, tuple[float, int, dict]] = {}
 
 
 MODEL_INPUT_PRICES_PER_1M = {
@@ -145,6 +149,101 @@ def _safe_json(value: str | None) -> dict:
         return {}
 
 
+def _sync_agent_logs(limit: int = 200) -> int:
+    """Import changed Copilot event snapshots without retaining prompt content."""
+    imported = 0
+    for path in discover_events_files(limit=limit):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        key = str(path)
+        cached = _AGENT_LOG_CACHE.get(key)
+        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+            continue
+        else:
+            snapshot = parse_events_file(path)
+            if snapshot:
+                _AGENT_LOG_CACHE[key] = (stat.st_mtime, stat.st_size, snapshot)
+        if not snapshot:
+            continue
+        if not snapshot.get("input_tokens") and not snapshot.get("output_tokens"):
+            continue
+        with db() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO copilot_agent_usage (
+                    source_path, source_hash, source_session_id, event_start, event_end,
+                    cwd, repository, model, copilot_version, requests, user_messages,
+                    model_turns, tool_calls, errors, compactions, compaction_tokens,
+                    input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+                    reasoning_tokens, total_tokens, system_tokens, conversation_tokens,
+                    tool_definitions_tokens, total_nano_aiu, model_usage, is_complete,
+                    imported_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot["source_path"], snapshot["source_hash"], snapshot["session_id"],
+                    snapshot.get("event_start"), snapshot.get("event_end"), snapshot.get("cwd"),
+                    snapshot.get("repository"), snapshot.get("model"), snapshot.get("copilot_version"),
+                    snapshot.get("requests", 0), snapshot.get("user_messages", 0), snapshot.get("model_turns", 0),
+                    snapshot.get("tool_calls", 0), snapshot.get("errors", 0), snapshot.get("compactions", 0),
+                    snapshot.get("compaction_tokens", 0), snapshot.get("input_tokens", 0), snapshot.get("output_tokens", 0),
+                    snapshot.get("cached_input_tokens", 0), snapshot.get("cache_write_tokens", 0),
+                    snapshot.get("reasoning_tokens", 0), snapshot.get("total_tokens", 0), snapshot.get("system_tokens", 0),
+                    snapshot.get("conversation_tokens", 0), snapshot.get("tool_definitions_tokens", 0),
+                    snapshot.get("total_nano_aiu", 0), json.dumps(snapshot.get("model_usage", []), separators=(",", ":")),
+                    int(bool(snapshot.get("is_complete"))), datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        imported += 1
+    return imported
+
+
+def _agent_log_rows(threshold: str, limit: int = 200) -> list[dict]:
+    _sync_agent_logs()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM copilot_agent_usage
+               WHERE COALESCE(event_end, event_start, imported_at) >= ?
+               ORDER BY COALESCE(event_end, event_start, imported_at) DESC LIMIT ?""",
+            (threshold, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _agent_usage_summary(threshold: str) -> dict:
+    rows = _agent_log_rows(threshold)
+    fields = ("requests", "user_messages", "model_turns", "tool_calls", "errors", "compactions",
+              "compaction_tokens", "input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens",
+              "reasoning_tokens", "total_tokens", "system_tokens", "conversation_tokens",
+              "tool_definitions_tokens", "total_nano_aiu")
+    totals = {field: sum(int(row.get(field) or 0) for row in rows) for field in fields}
+    model_mix: dict[str, dict[str, int]] = {}
+    for row in rows:
+        for model_row in _safe_json_list(row.get("model_usage")):
+            model = str(model_row.get("model") or row.get("model") or "unknown")
+            item = model_mix.setdefault(model, {"model": model, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "total_nano_aiu": 0})
+            for field in ("requests", "input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "total_nano_aiu"):
+                item[field] += int(model_row.get(field) or 0)
+    return {
+        **totals,
+        "sessions": len(rows),
+        "last_seen": max((row.get("event_end") or row.get("event_start") or "" for row in rows), default=None),
+        "source": "github_copilot_agent_logs" if rows else "not_reported",
+        "models": sorted(model_mix.values(), key=lambda item: item["input_tokens"] + item["output_tokens"], reverse=True),
+        "sessions_detail": rows,
+    }
+
+
+def _safe_json_list(value: str | list | None) -> list[dict]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+
 # ──────────────────────── REST API ────────────────────────────────────────
 
 @app.get("/api/status")
@@ -236,10 +335,34 @@ async def live_health():
     return {"status": "up" if all(s["status"] == "up" for s in services) else "degraded", "checked_at": datetime.now(timezone.utc).isoformat(), "services": services, "configured_ides": configured, "clients": clients}
 
 
+@app.post("/api/agent-logs/import")
+async def import_agent_logs():
+    """Refresh exact local Copilot agent usage snapshots."""
+    _AGENT_LOG_CACHE.clear()
+    count = _sync_agent_logs()
+    return {"imported": count, "source": str(Path.home() / ".copilot" / "session-state"), "read_only": True}
+
+
+@app.get("/api/agent-logs/sessions")
+async def agent_log_sessions(range: str = "all", limit: int = 100):
+    threshold = _threshold_for_range(range)
+    rows = _agent_log_rows(threshold, limit=max(1, min(limit, 500)))
+    for row in rows:
+        row["model_usage"] = _safe_json_list(row.get("model_usage"))
+        row["source"] = "github_copilot_agent_logs"
+    return rows
+
+
+@app.get("/api/agent-logs/usage")
+async def agent_log_usage(range: str = "day"):
+    return _agent_usage_summary(_threshold_for_range(range))
+
+
 @app.get("/api/copilot/summary")
 async def copilot_summary(range: str = "day"):
     """Token-optimizer metrics sourced from real Copilot proxy compression events."""
     threshold = _threshold_for_range(range)
+    agent_usage = _agent_usage_summary(threshold)
     with db() as conn:
         row = conn.execute(
             """SELECT COUNT(*) AS requests,
@@ -258,6 +381,7 @@ async def copilot_summary(range: str = "day"):
         model_rows = conn.execute(
             """SELECT COALESCE(model_used, 'unknown') AS model,
                       COUNT(*) AS requests,
+                      COALESCE(SUM(tokens_after), 0) AS tokens_after,
                       COALESCE(SUM(tokens_before - tokens_after), 0) AS tokens_saved
                FROM compressions
                WHERE source='byok' AND compressed_at >= ?
@@ -302,6 +426,20 @@ async def copilot_summary(range: str = "day"):
             actual_total += int(details.get("total_tokens", 0) or 0)
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
+    proxy_actual_input = actual_input
+    proxy_actual_output = actual_output
+    proxy_actual_cached = actual_cached
+    proxy_actual_total = actual_total
+    # GitHub's local agent shutdown record is the authoritative fallback when
+    # the upstream response did not expose a usage object to the proxy.
+    if not actual_input and agent_usage["input_tokens"]:
+        actual_input = agent_usage["input_tokens"]
+    if not actual_output and agent_usage["output_tokens"]:
+        actual_output = agent_usage["output_tokens"]
+    if not actual_cached and agent_usage["cached_input_tokens"]:
+        actual_cached = agent_usage["cached_input_tokens"]
+    if not actual_total and agent_usage["total_tokens"]:
+        actual_total = agent_usage["total_tokens"]
     return {
         "range": range,
         "requests": int(row["requests"] or 0),
@@ -316,7 +454,25 @@ async def copilot_summary(range: str = "day"):
         "actual_output_tokens": actual_output,
         "actual_cached_input_tokens": actual_cached,
         "actual_total_tokens": actual_total,
-        "measurement_note": "actual_* values come from GitHub usage; tokens_before/after are TrimP estimates",
+        "proxy_actual_input_tokens": proxy_actual_input,
+        "proxy_actual_output_tokens": proxy_actual_output,
+        "proxy_actual_cached_input_tokens": proxy_actual_cached,
+        "proxy_actual_total_tokens": proxy_actual_total,
+        "agent_log_input_tokens": agent_usage["input_tokens"],
+        "agent_log_output_tokens": agent_usage["output_tokens"],
+        "agent_log_cached_input_tokens": agent_usage["cached_input_tokens"],
+        "agent_log_total_tokens": agent_usage["total_tokens"],
+        "agent_log_requests": agent_usage["requests"],
+        "agent_log_model_turns": agent_usage["model_turns"],
+        "agent_log_tool_calls": agent_usage["tool_calls"],
+        "agent_log_errors": agent_usage["errors"],
+        "agent_log_compaction_tokens": agent_usage["compaction_tokens"],
+        "agent_log_total_nano_aiu": agent_usage["total_nano_aiu"],
+        "agent_log_sessions": agent_usage["sessions"],
+        "agent_log_last_seen": agent_usage["last_seen"],
+        "agent_log_models": agent_usage["models"],
+        "actual_usage_source": "proxy_response" if proxy_actual_input else agent_usage["source"],
+        "measurement_note": "actual_* values come from GitHub's proxy response or local agent logs; tokens_before/after and dollars_saved are TrimP estimates",
         "last_seen": row["last_seen"],
         "model_mix": model_mix,
         "repositories": [dict(r) for r in repo_rows],
@@ -906,15 +1062,20 @@ async def test_trim(body: dict):
     message = str(body.get("message") or "").strip()
     if not message:
         return {"ok": False, "error": "Enter a test message first."}
-    enabled = bool(body.get("enabled", True))
+    requested_enabled = body.get("enabled")
+    if requested_enabled is None:
+        enabled = str(get_config("compression.enabled", "true")).lower() in {"1", "true", "yes", "on"}
+    else:
+        enabled = bool(requested_enabled)
     request_body = {
         "model": body.get("model") or "gpt-5-mini",
         "messages": [{"role": "user", "content": message}],
     }
     optimized, stats = test_optimizer.optimize_body(request_body, enabled=enabled)
     optimized_message = str(optimized.get("messages", [{}])[-1].get("content") or "")
-    before_words = {word.lower() for word in message.split() if len(word) > 3}
-    after_words = {word.lower() for word in optimized_message.split() if len(word) > 3}
+    stopwords = {"about", "after", "before", "could", "every", "first", "from", "keep", "please", "same", "should", "that", "their", "there", "these", "this", "while", "with", "would"}
+    before_words = {word for word in re.findall(r"[a-zA-Z]{5,}", message.lower()) if word not in stopwords}
+    after_words = {word for word in re.findall(r"[a-zA-Z]{5,}", optimized_message.lower()) if word not in stopwords}
     preserved = len(before_words & after_words) / len(before_words) if before_words else 1.0
     reduction = stats.savings_pct / 100.0
     quality_score = max(0.0, min(1.0, (preserved * 0.55) + (min(1.0, reduction * 2) * 0.45)))
@@ -922,6 +1083,8 @@ async def test_trim(body: dict):
     return {
         "ok": True,
         "enabled": enabled,
+        "repository": str(body.get("repository") or "unassigned"),
+        "test_case": str(body.get("test_case") or "custom"),
         "model": request_body["model"],
         "message": message,
         "optimized_message": optimized_message,
@@ -934,6 +1097,12 @@ async def test_trim(body: dict):
             "compression_effectiveness": round(reduction * 100, 1),
             "structure_preserved": True,
             "note": "Preflight signals from the local request transformation; model answer quality requires an upstream A/B run.",
+        },
+        "calculation": {
+            "estimator": "len(serialized request) / 4, minimum 1",
+            "tokens_saved": "tokens_before - tokens_after",
+            "reduction_pct": "tokens_saved / tokens_before * 100",
+            "upstream_call": False,
         },
     }
 

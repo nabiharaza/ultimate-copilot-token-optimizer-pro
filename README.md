@@ -12,6 +12,7 @@ TrimP is designed for teams that need measurable savings without silently deleti
 - Supports Copilot CLI, PyCharm, Rider, and VS Code integration paths.
 - Stores local audit data in SQLite and exposes request, repository, model, conversation, and service-health views.
 - Shows real token estimates alongside upstream actual usage when GitHub returns usage metadata. Estimates and billed usage are intentionally labeled separately.
+- Imports exact GitHub Copilot Agent Debug Log usage snapshots from `~/.copilot/session-state/*/events.jsonl` when the local agent writes them.
 
 ## Install
 
@@ -38,7 +39,21 @@ Open [http://localhost:7432](http://localhost:7432). The dashboard includes:
 - Repository-level requests, before volume, saved tokens, and reduction
 - Live trim events with algorithm attribution
 - Conversation traces with original, optimized, response, and debug context
+- Agent Debug Log snapshots with input, cached input, output, total tokens, model turns, tool calls, errors, compaction tokens, AIU, model, repository, and local time
 - Service health for the BYOK proxy and IDE HTTPS bridge
+
+### Agent log accounting
+
+GitHub Copilot CLI agent logs include a cumulative `session.shutdown` usage record. TrimP imports `modelMetrics` without forwarding or modifying it:
+
+```text
+actual total tokens = actual input tokens + actual output tokens
+cached input tokens = cache-read tokens reported by Copilot
+```
+
+For example, a log containing `174,312` input tokens, `443` output tokens, and `83,840` cached input tokens is shown as `174,755` total tokens. Cached input is displayed separately because it is a billing and quota dimension, not silently subtracted from total input. TrimP never presents these upstream numbers as compression savings: TrimP savings remain `estimated before - estimated after` until a paired upstream baseline exists.
+
+The importer is read-only with respect to Copilot files and does not store prompt bodies or tool arguments. The dashboard exposes the imported snapshots at `/api/agent-logs/sessions` and the aggregate at `/api/agent-logs/usage`; `POST /api/agent-logs/import` forces a refresh.
 
 ## CLI commands
 

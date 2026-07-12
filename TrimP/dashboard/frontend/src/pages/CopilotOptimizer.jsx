@@ -16,6 +16,7 @@ import {
   Search,
   MessageSquare,
   MoreHorizontal,
+  Power,
   Server,
   Sparkles,
   Zap,
@@ -25,6 +26,11 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  Cell,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -306,6 +312,7 @@ export default function CopilotOptimizer({ onNavigate }) {
   const [repoSort, setRepoSort] = useState('tokens_saved')
   const [secretIndex, setSecretIndex] = useState(0)
   const [secretOpen, setSecretOpen] = useState(false)
+  const [optimizerEnabled, setOptimizerEnabled] = useState(true)
 
   async function load() {
     setLoading(true)
@@ -325,6 +332,11 @@ export default function CopilotOptimizer({ onNavigate }) {
       if (activityRes.ok) setActivity(await activityRes.json())
       const healthRes = await fetch('/api/live-health')
       if (healthRes.ok) setLiveHealth(await healthRes.json())
+      const configRes = await fetch('/api/config')
+      if (configRes.ok) {
+        const config = await configRes.json()
+        setOptimizerEnabled(String(config['compression.enabled'] ?? 'true') === 'true')
+      }
     } finally {
       setLoading(false)
     }
@@ -370,9 +382,12 @@ export default function CopilotOptimizer({ onNavigate }) {
           <button className="icon-button round-control" onClick={load} title="Refresh" aria-label="Refresh data">
             <RefreshCw size={16} />
           </button>
+          <div className={`optimizer-status-pill ${optimizerEnabled ? 'is-on' : 'is-off'}`} title={optimizerEnabled ? 'TrimPy is optimizing eligible requests' : 'TrimPy is off; requests pass through unchanged'}>
+            <Power size={14} /><span><strong>TrimPy {optimizerEnabled ? 'on' : 'off'}</strong><small>{optimizerEnabled ? 'Optimizing requests' : 'Pass-through mode'}</small></span>
+          </div>
           <button className={`live-health-button live-pill ${liveHealth?.status === 'up' ? 'is-up' : 'is-warning'}`} onClick={() => setShowHealth(!showHealth)} aria-label="Live service health">
             <span className="live-dot" />
-            <span><strong>{liveHealth?.status === 'up' ? 'Live' : 'Attention'}</strong><small>{liveHealth?.status === 'up' ? 'Working in real time' : 'Check services'}</small></span>
+            <span><strong>{liveHealth?.status === 'up' ? 'Services up' : 'Attention'}</strong><small>{liveHealth?.status === 'up' ? 'Health checks active' : 'Check services'}</small></span>
           </button>
         </div>
       </header>
@@ -437,7 +452,7 @@ export default function CopilotOptimizer({ onNavigate }) {
         <BarList title="Model Mix" rows={summary?.model_mix || []} />
       </section>
 
-      <details className="optimizer-panel live-trim-panel activity-strip"><summary><span><i className="pulse-icon"><Activity size={18} /></i><span><b>Live Trim Activity</b><small>{activity.length ? 'Real-time request optimization events' : 'Waiting for a request'}</small></span></span><span className={`activity-spark ${activity.length ? '' : 'is-idle'}`} aria-label={activity.length ? `${activity.length} live trim events` : 'No live trim events'}>{activityHeights.map((height, index) => <i key={index} style={{ height: `${height}px` }} />)}</span><strong>{activity.length} recent events <ChevronRight size={14} /></strong></summary>{activity.length ? <div className="activity-list">{activity.map(item => <div className="activity-row" key={item.id}><span>{item.repository}</span><span>{item.algorithm}</span><b>{formatNumber(item.tokens_saved)} saved</b></div>)}</div> : <div className="optimizer-empty-small">No trim events yet. The activity graph will rise when TrimP receives a request.</div>}</details>
+      <details className="optimizer-panel live-trim-panel activity-strip" open><summary><span><i className="pulse-icon"><Activity size={18} /></i><span><b>Live Trim Activity</b><small>{activity.length ? 'Real-time request optimization events' : 'Waiting for a request'}</small></span></span><span className={`activity-spark ${activity.length ? '' : 'is-idle'}`} aria-label={activity.length ? `${activity.length} live trim events` : 'No live trim events'}>{activityHeights.map((height, index) => <i key={index} style={{ height: `${height}px` }} />)}</span><strong>{activity.length} recent events <ChevronRight size={14} /></strong></summary>{activity.length ? <div className="activity-list">{activity.map(item => <div className="activity-row" key={item.id}><span>{item.repository}</span><span>{item.algorithm}</span><b>{formatNumber(item.tokens_saved)} saved</b></div>)}</div> : <div className="optimizer-empty-small">No trim events yet. The activity graph will rise when TrimP receives a request.</div>}</details>
 
       <details className="optimizer-panel repo-live-panel repository-panel">
         <summary>

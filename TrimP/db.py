@@ -224,6 +224,40 @@ CREATE TABLE IF NOT EXISTS activity_modes (
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
+-- 16. copilot_agent_usage
+-- Exact usage snapshots imported from local GitHub Copilot agent logs.
+CREATE TABLE IF NOT EXISTS copilot_agent_usage (
+    source_path TEXT PRIMARY KEY,
+    source_hash TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    event_start TEXT,
+    event_end TEXT,
+    cwd TEXT,
+    repository TEXT,
+    model TEXT,
+    copilot_version TEXT,
+    requests INTEGER DEFAULT 0,
+    user_messages INTEGER DEFAULT 0,
+    model_turns INTEGER DEFAULT 0,
+    tool_calls INTEGER DEFAULT 0,
+    errors INTEGER DEFAULT 0,
+    compactions INTEGER DEFAULT 0,
+    compaction_tokens INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cached_input_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    system_tokens INTEGER DEFAULT 0,
+    conversation_tokens INTEGER DEFAULT 0,
+    tool_definitions_tokens INTEGER DEFAULT 0,
+    total_nano_aiu INTEGER DEFAULT 0,
+    model_usage TEXT,
+    is_complete INTEGER DEFAULT 0,
+    imported_at TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_turns_session        ON turns(session_id);
 CREATE INDEX IF NOT EXISTS idx_compressions_session ON compressions(session_id);
@@ -233,6 +267,8 @@ CREATE INDEX IF NOT EXISTS idx_archives_key         ON archives(archive_key);
 CREATE INDEX IF NOT EXISTS idx_savings_session      ON savings(session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started     ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_compressions_compressor ON compressions(compressor);
+CREATE INDEX IF NOT EXISTS idx_agent_usage_end ON copilot_agent_usage(event_end);
+CREATE INDEX IF NOT EXISTS idx_agent_usage_session ON copilot_agent_usage(source_session_id);
 """
 
 # Safely add new columns to existing DBs without destroying data
