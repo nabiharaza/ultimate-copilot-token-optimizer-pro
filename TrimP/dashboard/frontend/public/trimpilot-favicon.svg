@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title>TrimPy</title>
+  <desc>TrimPy token optimizer mark</desc>
+  <rect width="64" height="64" rx="16" fill="#f8fffc"/>
+  <circle cx="32" cy="32" r="23" fill="none" stroke="#0f766e" stroke-width="4"/>
+  <path d="M32 13 43 42 32 35 21 42Z" fill="#059669"/>
+  <path d="M22 39 14 49 25 45ZM42 39 50 49 39 45Z" fill="#172033"/>
+  <path d="M32 36v15" stroke="#87919e" stroke-width="2" stroke-dasharray="4 4"/>
+  <path d="m25 47 7 7 7-7" fill="none" stroke="#f97316" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

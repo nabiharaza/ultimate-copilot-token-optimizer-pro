@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# TrimP-copilot: Wrapper for GitHub Copilot CLI with TrimP compression
+#
+# Usage: TrimP-copilot [copilot arguments]
+# Example: TrimP-copilot -p "Explain this code"
+
+set -e
+
+# Set default API URL if not already set (for Enterprise/data residency)
+export GITHUB_COPILOT_API_URL="${GITHUB_COPILOT_API_URL:-https://api.githubcopilot.com}"
+
+# Start TrimP BYOK proxy if not running
+PROXY_PORT=8766
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE_CWD="$(pwd)"
+if ! curl -s http://localhost:$PROXY_PORT/v1/health >/dev/null 2>&1; then
+    echo "🚀 Starting TrimP BYOK proxy on port $PROXY_PORT..."
+    python3 "$ROOT_DIR/byok_server.py" --port "$PROXY_PORT" &
+    PROXY_PID=$!
+    sleep 2
+fi
+
+# Hand the caller's project directory to the already-running proxy. This keeps
+# dashboard repo/cwd attribution tied to where Copilot was launched.
+python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+cwd = os.environ.get("WORKSPACE_CWD") or os.getcwd()
+
+def run_git(args):
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=cwd,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+    except Exception:
+        return ""
+
+remote = run_git(["remote", "get-url", "origin"])
+repo = remote.rstrip("/").split("/")[-1].replace(".git", "") if remote else Path(cwd).name
+branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
+path = Path.home() / ".trimp" / "proxy_context.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({"cwd": cwd, "repository": repo, "branch": branch}, indent=2) + "\n")
+PY
+
+# Configure Copilot CLI to use TrimP proxy. Copilot CLI's BYOK path reads
+# COPILOT_PROVIDER_BASE_URL; keep COPILOT_PROVIDER_URL for older/local scripts.
+export COPILOT_PROVIDER_BASE_URL="http://localhost:$PROXY_PORT/v1"
+export COPILOT_PROVIDER_URL="$COPILOT_PROVIDER_BASE_URL"
+export COPILOT_PROVIDER_TYPE="${COPILOT_PROVIDER_TYPE:-openai}"
+export COPILOT_PROVIDER_WIRE_API="${COPILOT_PROVIDER_WIRE_API:-completions}"
+export COPILOT_MODEL="${COPILOT_MODEL:-claude-sonnet-4.6}"
+
+echo "✅ TrimP compression enabled"
+echo "🌐 API: $GITHUB_COPILOT_API_URL"
+echo "🔧 Proxy: $COPILOT_PROVIDER_BASE_URL"
+echo "🤖 Model: $COPILOT_MODEL"
+echo "📁 Workspace: $WORKSPACE_CWD"
+echo ""
+
+# Run copilot with BYOK mode. Provider selection is controlled by
+# COPILOT_PROVIDER_* environment variables in current Copilot CLI builds.
+exec copilot --model "$COPILOT_MODEL" "$@"

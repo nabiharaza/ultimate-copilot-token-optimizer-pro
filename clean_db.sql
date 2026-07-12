@@ -1,0 +1,16 @@
+DELETE FROM compressions;
+DELETE FROM quality_scores;
+DELETE FROM savings;
+DELETE FROM compression_patterns;
+DELETE FROM activity_modes;
+DELETE FROM loop_detections;
+DELETE FROM model_routing;
+DELETE FROM token_budgets;
+DELETE FROM memory_audits;
+DELETE FROM session_files;
+DELETE FROM archives;
+DELETE FROM turns;
+DELETE FROM sessions;
+DELETE FROM checkpoints;
+DELETE FROM sqlite_sequence;
+VACUUM;

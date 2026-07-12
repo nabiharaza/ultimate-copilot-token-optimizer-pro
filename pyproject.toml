@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trim-pilot"
+version = "1.0.0"
+description = "Trim-Pilot token optimizer for GitHub Copilot Enterprise"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Trim-Pilot"}]
+
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13",
+    "textual>=0.62",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12",
+    "aiosqlite>=0.20",
+    "click>=8",
+    "pydantic>=2",
+    "httpx>=0.27",
+    "python-dateutil>=2.9",
+    "tabulate>=0.9",
+    "humanize>=4",
+    "watchfiles>=0.22",
+    "psutil>=5.9",
+]
+
+[project.scripts]
+trimp = "TrimP.cli:app"
+TrimP = "TrimP.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["TrimP*"]
+
+[tool.setuptools.package-data]
+"TrimP.dashboard" = ["frontend/dist/**/*", "frontend/public/**/*"]
