@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Activity, CalendarDays, ChevronLeft, ChevronRight, Download, Filter, MessageSquare, MoreVertical, Search, SlidersHorizontal, Sparkles, Tag, X } from 'lucide-react'
+import { Activity, CalendarDays, ChevronLeft, ChevronRight, Download, Filter, MessageSquare, MoreVertical, Search, SlidersHorizontal, Sparkles, Tag, X, Monitor, DollarSign, Database, Code2 } from 'lucide-react'
 import { Loading } from '../components/Charts.jsx'
 
 const PERIODS = [
@@ -39,6 +39,10 @@ function modelName(value) {
   return String(value || 'Unknown model').replace(/^github\//, '')
 }
 
+function pretty(value) {
+  try { return JSON.stringify(value ?? {}, null, 2) } catch { return String(value || '') }
+}
+
 function ConversationDetail({ row }) {
   return (
     <tr className="conversation-detail-row">
@@ -66,16 +70,19 @@ export default function Sessions({ onNavigate }) {
   const [expanded, setExpanded] = useState(null)
   const [loading, setLoading] = useState(true)
   const [agentRows, setAgentRows] = useState([])
+  const [debugSessions, setDebugSessions] = useState([])
 
   async function load() {
     setLoading(true)
     try {
-      const [response, agentResponse] = await Promise.all([
+      const [response, agentResponse, debugResponse] = await Promise.all([
         fetch(`/api/copilot/conversations?range=${period}&limit=500`),
         fetch(`/api/agent-logs/sessions?range=${period}&limit=100`),
+        fetch(`/api/copilot/debug-sessions?range=${period}&limit=50`),
       ])
       if (response.ok) setRows(await response.json())
       if (agentResponse.ok) setAgentRows(await agentResponse.json())
+      if (debugResponse.ok) setDebugSessions(await debugResponse.json())
     } finally {
       setLoading(false)
     }
@@ -155,6 +162,17 @@ export default function Sessions({ onNavigate }) {
         <SummaryCard icon={Tag} label="Estimated Cost Saved" value={formatMoney(totals.dollars)} sub="total saved" />
       </section>
 
+      <section className="debug-session-card">
+        <header className="debug-session-card-header">
+          <div><div className="conversation-kicker"><Monitor size={14} /> IDE session trace</div><h2>Conversations grouped by session</h2><p>One IDE session contains every chat and model request. Expand a session to inspect exact upstream usage, context, and cost.</p></div>
+          <span className="usage-source-badge reported">{debugSessions.length} IDE sessions</span>
+        </header>
+        <div className="debug-session-list">
+          {debugSessions.map(session => <DebugSessionGroup key={session.session_id} session={session} />)}
+          {!debugSessions.length && <div className="conversation-empty">No IDE debug sessions found for this period.</div>}
+        </div>
+      </section>
+
       <section className="agent-log-table-card"><header><div><div className="conversation-kicker"><Activity size={14} /> Exact upstream usage</div><h2>GitHub Copilot Agent Debug Logs</h2><p>Session snapshots imported from local <code>events.jsonl</code> files. Cached input, output, turns, tools, and totals are reported by Copilot.</p></div><span className="usage-source-badge reported">{agentRows.length} sessions</span></header><div className="agent-log-table-wrap"><table className="agent-log-table"><thead><tr><th>Time</th><th>Repository</th><th>Model</th><th>Input</th><th>Cached</th><th>Output</th><th>Total</th><th>Turns</th><th>Tools</th><th>Errors</th></tr></thead><tbody>{agentRows.map(row => <tr key={row.source_session_id}><td><b>{formatDate(row.event_end)}</b><small>{formatTime(row.event_end)}</small></td><td><b>{row.repository || row.cwd || 'Unknown repository'}</b><small>{row.source_session_id}</small></td><td><span className="model-pill">{modelName(row.model)}</span></td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.cached_input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td className="saved-value">{formatNumber(row.total_tokens)}</td><td>{formatNumber(row.model_turns)}</td><td>{formatNumber(row.tool_calls)}</td><td>{formatNumber(row.errors)}</td></tr>)}</tbody></table>{!agentRows.length && <div className="conversation-empty">No local agent usage snapshots found for this period.</div>}</div></section>
 
       <section className="conversation-table-card">
@@ -175,6 +193,62 @@ function ChevronDownIcon() {
 
 function SummaryCard({ icon: Icon, label, value, sub }) {
   return <article className="conversation-summary-card"><span className="conversation-summary-icon"><Icon size={21} /></span><div><span>{label}</span><strong>{value}</strong><small>{sub}</small></div></article>
+}
+
+function DebugSessionGroup({ session }) {
+  const [open, setOpen] = useState(false)
+  const exact = session.primary_usage || {}
+  const trim = session.trimpy || {}
+  const exactUsage = session.usage_source === 'ide_debug_log'
+  const usageLabel = exactUsage ? 'exact input' : 'observed input'
+  return (
+    <article className={`debug-session-group ${open ? 'is-open' : ''}`}>
+      <button className="debug-session-summary" onClick={() => setOpen(value => !value)} aria-expanded={open}>
+        <span className="debug-session-chevron"><ChevronRight size={17} /></span>
+        <span className="debug-session-main"><strong>{session.repository || 'Unknown repository'}</strong><small>{session.ide} · {formatDate(session.started_at)} {formatTime(session.started_at)} · {session.request_count} model requests</small><code>{session.session_id}</code></span>
+        <span className="debug-session-stat"><b>{formatNumber(exact.input_tokens)}</b><small>{usageLabel}</small></span>
+        <span className="debug-session-stat"><b>{formatNumber(exact.cached_tokens)}</b><small>cached</small></span>
+        <span className="debug-session-stat"><b>{formatMoney(session.exact_cost_estimate)}</b><small>cost estimate</small></span>
+      </button>
+      {open && <div className="debug-session-detail">
+        <div className="debug-session-meta"><span><Monitor size={14} /> {session.ide}</span><span><Code2 size={14} /> {session.cwd || 'Workspace unavailable'}</span><span><Database size={14} /> {session.model_turns} primary chats, {session.request_count - session.model_turns} supporting requests</span></div>
+        <div className="debug-metric-grid">
+          <Metric label={exactUsage ? 'Exact input' : 'Observed input'} value={formatNumber(exact.input_tokens)} note={exactUsage ? 'reported by IDE' : 'proxy response or sent volume'} />
+          <Metric label="Cached input" value={formatNumber(exact.cached_tokens)} note="included in input" />
+          <Metric label="Exact output" value={formatNumber(exact.output_tokens)} note="reported by IDE" />
+          <Metric label="Exact total" value={formatNumber(exact.total_tokens)} note="input + output" />
+          <Metric label="Cost estimate" value={formatMoney(session.exact_cost_estimate)} note="all model requests" />
+          <Metric label="TrimPy cost avoided" value={formatMoney(trim.estimated_cost_saved)} note={`${formatNumber(trim.tokens_saved)} estimated tokens`} />
+        </div>
+        <div className="debug-session-note"><DollarSign size={14} /><span><b>How cost is calculated:</b> uncached input × input rate + cached input × cache-read rate + output × output rate. {session.pricing_basis}.</span></div>
+        {trim.requests > 0 && <div className="debug-trim-comparison"><b>TrimPy correlation near this session</b><span>{formatNumber(trim.tokens_before)} before → {formatNumber(trim.tokens_after)} after · {formatNumber(trim.tokens_saved)} estimated saved · {trim.savings_pct}% reduction</span></div>}
+        <div className="debug-turn-list">
+          {session.turns.map((turn, index) => <DebugTurn key={turn.source_key || index} turn={turn} index={index} />)}
+        </div>
+      </div>}
+    </article>
+  )
+}
+
+function Metric({ label, value, note }) {
+  return <div className="debug-metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>
+}
+
+function DebugTurn({ turn, index }) {
+  const [open, setOpen] = useState(false)
+  return <article className={`debug-turn ${turn.request_kind === 'supporting' ? 'supporting' : ''}`}>
+    <button className="debug-turn-summary" onClick={() => setOpen(value => !value)} aria-expanded={open}>
+      <span className="debug-turn-number">{turn.request_kind === 'primary' ? `Chat ${turn.turn_index + 1}` : 'Supporting'}</span>
+      <span className="debug-turn-prompt"><b>{turn.user_message || turn.debug_name || 'Model request'}</b><small>{modelName(turn.model)} · {formatTime(turn.occurred_at)} · {turn.status}</small></span>
+      <span><b>{formatNumber(turn.input_tokens)}</b><small>input</small></span><span><b>{formatNumber(turn.cached_tokens)}</b><small>cached</small></span><span><b>{formatNumber(turn.output_tokens)}</b><small>output</small></span><span className="saved-value"><b>{formatMoney(turn.exact_cost_estimate)}</b><small>estimate</small></span><ChevronRight className="debug-turn-arrow" size={16} />
+    </button>
+    {open && <div className="debug-turn-detail">
+      <div className="debug-turn-context-summary"><span><b>Uncached input</b> {formatNumber(turn.uncached_input_tokens)}</span><span><b>TTFT</b> {formatNumber(turn.ttft_ms)} ms</span><span><b>Max output</b> {formatNumber(turn.max_output_tokens)}</span><span><b>Response status</b> {turn.status}</span></div>
+      {turn.user_message && <div className="debug-prompt-block"><label>User chat</label><pre>{turn.user_message}</pre></div>}
+      <details open><summary>Full context sent to model</summary><pre>{pretty(turn.context)}</pre></details>
+      <details><summary>Raw debug trace</summary><pre>{pretty(turn.trace)}</pre></details>
+    </div>}
+  </article>
 }
 
 function ConversationBrowserRow({ row, expanded, onToggle }) {
