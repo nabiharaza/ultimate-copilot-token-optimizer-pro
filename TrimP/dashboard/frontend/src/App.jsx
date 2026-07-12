@@ -14,6 +14,7 @@ import DiffReview from './pages/DiffReview.jsx'
 import Feedback from './pages/Feedback.jsx'
 import LiveTest from './pages/LiveTest.jsx'
 import Alerts from './pages/Alerts.jsx'
+import ValidationCenter from './pages/ValidationCenter.jsx'
 
 export default function App() {
   // Persistent page state (survives refresh)
@@ -38,6 +39,7 @@ export default function App() {
     policy: TrimPolicy,
     diff: DiffReview,
     demo: LiveTest,
+    validation: ValidationCenter,
     activity: Repositories,
     live: CompressionLive,
     sessions: Sessions,

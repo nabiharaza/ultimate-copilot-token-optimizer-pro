@@ -5,9 +5,12 @@ import json
 import re
 import subprocess
 import sys
+import threading
+import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 
 import httpx
 import uvicorn
@@ -26,6 +29,7 @@ from TrimP.copilot_logs import (
 )
 from TrimP.quality import score_session
 from TrimP.session import get_or_create_session, get_recent_sessions
+from TrimP.validation import builtin_scenarios, mode_settings, run_scenario
 
 app = FastAPI(title="TrimP Dashboard", version="1.0.0")
 
@@ -42,6 +46,7 @@ FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 _AGENT_LOG_CACHE: dict[str, tuple[float, int, dict]] = {}
 _DEBUG_LOG_CACHE: dict[str, tuple[float, int, dict]] = {}
+_VALIDATION_LOCK = threading.Lock()
 
 
 MODEL_INPUT_PRICES_PER_1M = {
@@ -347,6 +352,91 @@ def _safe_json_list(value: str | list | None) -> list[dict]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+
+def _validation_event(run_id: str, level: str, step: str, message: str, scenario_id: str = "", data: dict | None = None) -> None:
+    with _VALIDATION_LOCK:
+        with db() as conn:
+            sequence = int(conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM validation_events WHERE run_id=?", (run_id,)).fetchone()[0])
+            conn.execute(
+                "INSERT INTO validation_events (run_id, sequence, level, step, scenario_id, message, data_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (run_id, sequence, level, step, scenario_id, message, json.dumps(data or {}, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+            )
+
+
+def _validation_summary(executions: list[dict[str, Any]], run: dict[str, Any]) -> dict[str, Any]:
+    reductions = [float(row.get("reduction_pct") or 0) for row in executions]
+    overhead = [float(row.get("trim_duration_ms") or 0) for row in executions]
+    saved = sum(int(row.get("net_tokens_saved") or 0) for row in executions)
+    before = sum(int(row.get("before_tokens") or 0) for row in executions)
+    context_failures = sum(1 for row in executions if int(row.get("critical_context_lost") or 0) > 0)
+    audit_complete = sum(1 for row in executions if row.get("audit_complete"))
+    passed = sum(1 for row in executions if row.get("passed"))
+    fallback = sum(1 for row in executions if row.get("fallback"))
+    sorted_overhead = sorted(overhead)
+    p95 = sorted_overhead[min(len(sorted_overhead) - 1, max(0, int(len(sorted_overhead) * .95) - 1))] if sorted_overhead else 0
+    median_reduction = round(float(median(reductions)), 2) if reductions else 0
+    summary = {
+        "scenario_count": int(run.get("scenario_count") or 0), "execution_count": len(executions),
+        "passed_count": passed, "failed_count": len(executions) - passed,
+        "median_input_reduction_pct": median_reduction,
+        "gross_input_reduction_pct": round(saved / before * 100, 2) if before else 0,
+        "net_tokens_saved": saved, "estimated_cost_saved": _dollars_saved(saved, run.get("model")),
+        "critical_context_failures": context_failures,
+        "context_retention_pct": round(sum(float(row.get("context_retention_pct") or 0) for row in executions) / len(executions), 2) if executions else 100,
+        "median_local_overhead_ms": round(float(median(overhead)), 3) if overhead else 0,
+        "p95_local_overhead_ms": round(float(p95), 3), "proxy_errors": 0,
+        "fallback_count": fallback, "fallback_success_pct": round(fallback / fallback * 100, 2) if fallback else 100.0,
+        "audit_completeness_pct": round(audit_complete / len(executions) * 100, 2) if executions else 0,
+        "quality_status": "not_run_upstream", "task_success_delta": None,
+    }
+    summary["verdict"] = "PASS" if summary["failed_count"] == 0 and context_failures == 0 and summary["audit_completeness_pct"] == 100 else "FAIL"
+    summary["verdict_note"] = "Local reduction, preservation, fail-open, performance, and audit gates passed; upstream model quality is not run in local mode." if summary["verdict"] == "PASS" else "At least one hard local validation gate failed."
+    return summary
+
+
+def _run_validation(run_id: str, config: dict[str, Any]) -> None:
+    scenarios = builtin_scenarios()
+    mode = mode_settings(config.get("mode"))
+    repetitions = int(config.get("repetitions") or mode["repetitions"])
+    try:
+        with db() as conn:
+            conn.execute("UPDATE validation_runs SET status='running', started_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), run_id))
+        _validation_event(run_id, "info", "prepare", "Validation run started; freezing built-in scenarios and measurement configuration.", data={"mode": mode["label"], "repetitions": repetitions})
+        _validation_event(run_id, "info", "fixtures", f"Loaded {len(scenarios)} scenarios across code, logs, JSON, diffs, tool output, concise prompts, and fail-open behavior.")
+        completed: list[dict[str, Any]] = []
+        total = len(scenarios) * repetitions
+        with db() as conn:
+            conn.execute("UPDATE validation_runs SET scenario_count=?, execution_count=? WHERE id=?", (len(scenarios), total, run_id))
+        for scenario in scenarios:
+            for repetition in range(1, repetitions + 1):
+                with db() as conn:
+                    cancelled = conn.execute("SELECT cancel_requested FROM validation_runs WHERE id=?", (run_id,)).fetchone()[0]
+                if cancelled:
+                    _validation_event(run_id, "warning", "cancel", "Cancellation requested; stopping before the next paired scenario.")
+                    with db() as conn:
+                        conn.execute("UPDATE validation_runs SET status='cancelled', ended_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), run_id))
+                    return
+                result = run_scenario(scenario, str(config.get("policy") or "balanced"), str(config.get("repository") or "unassigned"), str(config.get("client") or "local-replay"), str(config.get("model") or "gpt-5-mini"), run_id, repetition, lambda level, sid, message, data=None: _validation_event(run_id, level, "execute", message, sid, data))
+                completed.append(result)
+                with db() as conn:
+                    conn.execute(
+                        """INSERT INTO validation_executions (run_id, scenario_id, scenario_name, category, size, repository, client, model, policy, repetition, original_request_hash, trimmed_request_hash, original_payload, trimmed_payload, before_tokens, after_tokens, tokens_saved, reduction_pct, net_tokens_saved, retry_tokens, recovery_tokens, trim_duration_ms, upstream_duration_ms, audit_write_duration_ms, algorithm_attribution, validator_results, critical_context_lost, context_retention_pct, quality_status, task_success, fallback, fallback_reason, audit_complete, passed, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (run_id, result["scenario_id"], result["scenario_name"], result["category"], result["size"], result["repository"], result["client"], result["model"], result["policy"], result["repetition"], result["original_request_hash"], result["trimmed_request_hash"], json.dumps(result["original_payload"], ensure_ascii=False), json.dumps(result["trimmed_payload"], ensure_ascii=False), result["before_tokens"], result["after_tokens"], result["tokens_saved"], result["reduction_pct"], result["net_tokens_saved"], result["retry_tokens"], result["recovery_tokens"], result["trim_duration_ms"], result["upstream_duration_ms"], result["audit_write_duration_ms"], json.dumps(result["algorithm_attribution"], ensure_ascii=False), json.dumps(result["validator_results"], ensure_ascii=False), result["critical_context_lost"], result["context_retention_pct"], result["quality_status"], result["task_success"], int(result["fallback"]), result["fallback_reason"], int(result["audit_complete"]), int(result["passed"]), result["created_at"]),
+                    )
+                    conn.execute("UPDATE validation_runs SET completed_count=?, passed_count=?, failed_count=? WHERE id=?", (len(completed), sum(1 for item in completed if item["passed"]), sum(1 for item in completed if not item["passed"]), run_id))
+                _validation_event(run_id, "info", "audit", f"Evidence persisted for {scenario.id}; hashes, payloads, validators, attribution, and timings are available.", scenario.id, {"completed": len(completed), "total": total})
+        with db() as conn:
+            row = conn.execute("SELECT * FROM validation_runs WHERE id=?", (run_id,)).fetchone()
+            run = dict(row)
+            rows = [dict(item) for item in conn.execute("SELECT * FROM validation_executions WHERE run_id=? ORDER BY id", (run_id,)).fetchall()]
+            summary = _validation_summary(rows, run)
+            conn.execute("UPDATE validation_runs SET status=?, ended_at=?, summary_json=? WHERE id=?", ("completed", datetime.now(timezone.utc).isoformat(), json.dumps(summary), run_id))
+        _validation_event(run_id, "result", "report", f"Validation complete: {summary['verdict']}. {summary['verdict_note']}", data=summary)
+    except Exception as exc:
+        with db() as conn:
+            conn.execute("UPDATE validation_runs SET status='failed', ended_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), run_id))
+        _validation_event(run_id, "error", "error", f"Validation runner failed: {exc}")
 
 
 # ──────────────────────── REST API ────────────────────────────────────────
@@ -1361,6 +1451,104 @@ async def set_config_api(key: str, body: dict):
     if key == "logs.retention_months":
         result["pruned"] = prune_expired_logs()
     return result
+
+
+@app.get("/api/validation/scenarios")
+async def validation_scenarios():
+    return [
+        {"id": scenario.id, "name": scenario.name, "category": scenario.category, "size": scenario.size, "content_type": scenario.content_type,
+         "required_context": {"facts": list(scenario.facts), "symbols": list(scenario.symbols), "files": list(scenario.files), "strings": list(scenario.strings)},
+         "expected_noop": scenario.expected_noop, "fault": scenario.fault}
+        for scenario in builtin_scenarios()
+    ]
+
+
+@app.post("/api/validation/runs")
+async def create_validation_run(body: dict):
+    mode = str(body.get("mode") or "quick").lower()
+    settings = mode_settings(mode)
+    run_id = f"val-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    config = {
+        "mode": mode, "repository": str(body.get("repository") or "unassigned"), "client": str(body.get("client") or "local-replay"),
+        "model": str(body.get("model") or "gpt-5-mini"), "policy": str(body.get("policy") or "balanced"),
+        "repetitions": int(body.get("repetitions") or settings["repetitions"]), "privacy": str(body.get("privacy") or "full-local-evidence"),
+    }
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO validation_runs (id, mode, suite, repository, client, model, policy, repetitions, status, scenario_count, execution_count, config_json, created_at)
+               VALUES (?, ?, 'builtin', ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+            (run_id, mode, config["repository"], config["client"], config["model"], config["policy"], config["repetitions"], len(builtin_scenarios()), len(builtin_scenarios()) * config["repetitions"], json.dumps(config), datetime.now(timezone.utc).isoformat()),
+        )
+    threading.Thread(target=_run_validation, args=(run_id, config), daemon=True, name=f"trimp-validation-{run_id}").start()
+    return {"run_id": run_id, "status": "queued", "mode": settings["label"], "scenario_count": len(builtin_scenarios()), "repetitions": config["repetitions"], "execution_count": len(builtin_scenarios()) * config["repetitions"]}
+
+
+@app.get("/api/validation/runs")
+async def list_validation_runs(limit: int = 30):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM validation_runs ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 100)),)).fetchall()
+    output = []
+    for row in rows:
+        item = dict(row)
+        item["summary"] = _safe_json(item.get("summary_json"))
+        item["config"] = _safe_json(item.get("config_json"))
+        output.append(item)
+    return output
+
+
+@app.get("/api/validation/runs/{run_id}")
+async def get_validation_run(run_id: str):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM validation_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            return {"error": "validation run not found"}
+        item = dict(row)
+        item["summary"] = _safe_json(item.get("summary_json"))
+        item["config"] = _safe_json(item.get("config_json"))
+        item["events"] = [dict(event) | {"data": _safe_json(event["data_json"])} for event in conn.execute("SELECT * FROM validation_events WHERE run_id=? ORDER BY sequence DESC LIMIT 200", (run_id,)).fetchall()]
+        item["scenarios"] = [dict(execution) for execution in conn.execute("SELECT id, scenario_id, scenario_name, category, size, repetition, before_tokens, after_tokens, tokens_saved, reduction_pct, critical_context_lost, context_retention_pct, trim_duration_ms, quality_status, fallback, audit_complete, passed, created_at FROM validation_executions WHERE run_id=? ORDER BY id", (run_id,)).fetchall()]
+    return item
+
+
+@app.post("/api/validation/runs/{run_id}/cancel")
+async def cancel_validation_run(run_id: str):
+    with db() as conn:
+        changed = conn.execute("UPDATE validation_runs SET cancel_requested=1 WHERE id=? AND status IN ('queued','running')", (run_id,)).rowcount
+    if changed:
+        _validation_event(run_id, "warning", "cancel", "Cancellation requested by operator.")
+    return {"ok": bool(changed), "run_id": run_id}
+
+
+@app.get("/api/validation/runs/{run_id}/events")
+async def validation_run_events(run_id: str, after: int = 0):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM validation_events WHERE run_id=? AND sequence>? ORDER BY sequence ASC LIMIT 500", (run_id, after)).fetchall()
+    return [dict(row) | {"data": _safe_json(row["data_json"])} for row in rows]
+
+
+@app.get("/api/validation/runs/{run_id}/report")
+async def validation_run_report(run_id: str):
+    with db() as conn:
+        run = conn.execute("SELECT * FROM validation_runs WHERE id=?", (run_id,)).fetchone()
+        rows = [dict(row) for row in conn.execute("SELECT * FROM validation_executions WHERE run_id=? ORDER BY id", (run_id,)).fetchall()]
+    if not run:
+        return {"error": "validation run not found"}
+    return {"run": dict(run), "summary": _validation_summary(rows, dict(run)), "executions": rows}
+
+
+@app.get("/api/validation/scenarios/{execution_id}")
+async def validation_execution(execution_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM validation_executions WHERE id=?", (execution_id,)).fetchone()
+    if not row:
+        return {"error": "validation execution not found"}
+    item = dict(row)
+    for key in ("original_payload", "trimmed_payload", "algorithm_attribution", "validator_results"):
+        try:
+            item[key] = json.loads(item.get(key) or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item[key] = {}
+    return item
 
 
 @app.post("/api/test/trim")

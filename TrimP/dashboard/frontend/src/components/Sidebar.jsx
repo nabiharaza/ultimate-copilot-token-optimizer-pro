@@ -1,4 +1,4 @@
-import { Activity, Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Settings, SlidersHorizontal } from 'lucide-react'
+import { Activity, Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Settings, ShieldCheck, SlidersHorizontal } from 'lucide-react'
 import { useState } from 'react'
 
 const SIDEBAR_ITEMS = [
@@ -12,6 +12,7 @@ const SIDEBAR_ITEMS = [
   { id: 'sessions', icon: MessageSquare, label: 'Conversations' },
   { id: 'live', icon: Activity, label: 'Live activity' },
   { id: 'demo', icon: FlaskConical, label: 'Experiments' },
+  { id: 'validation', icon: ShieldCheck, label: 'Validation' },
   { section: 'Admin' },
   { id: 'diff', icon: FileDiff, label: 'Diff review' },
   { id: 'alerts', icon: Bell, label: 'Alerts' },

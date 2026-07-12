@@ -289,6 +289,85 @@ CREATE TABLE IF NOT EXISTS copilot_debug_turns (
     imported_at TEXT NOT NULL
 );
 
+-- 18. validation_runs
+CREATE TABLE IF NOT EXISTS validation_runs (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    suite TEXT NOT NULL DEFAULT 'builtin',
+    repository TEXT,
+    client TEXT DEFAULT 'local-replay',
+    model TEXT DEFAULT 'gpt-5-mini',
+    policy TEXT DEFAULT 'balanced',
+    repetitions INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'queued', -- queued | running | completed | failed | cancelled
+    scenario_count INTEGER DEFAULT 0,
+    execution_count INTEGER DEFAULT 0,
+    completed_count INTEGER DEFAULT 0,
+    passed_count INTEGER DEFAULT 0,
+    failed_count INTEGER DEFAULT 0,
+    started_at TEXT,
+    ended_at TEXT,
+    summary_json TEXT,
+    config_json TEXT,
+    cancel_requested INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+-- 19. validation_executions
+CREATE TABLE IF NOT EXISTS validation_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    scenario_id TEXT NOT NULL,
+    scenario_name TEXT,
+    category TEXT,
+    size TEXT,
+    repository TEXT,
+    client TEXT,
+    model TEXT,
+    policy TEXT,
+    repetition INTEGER DEFAULT 1,
+    original_request_hash TEXT,
+    trimmed_request_hash TEXT,
+    original_payload TEXT,
+    trimmed_payload TEXT,
+    before_tokens INTEGER DEFAULT 0,
+    after_tokens INTEGER DEFAULT 0,
+    tokens_saved INTEGER DEFAULT 0,
+    reduction_pct REAL DEFAULT 0,
+    net_tokens_saved INTEGER DEFAULT 0,
+    retry_tokens INTEGER DEFAULT 0,
+    recovery_tokens INTEGER DEFAULT 0,
+    trim_duration_ms REAL DEFAULT 0,
+    upstream_duration_ms REAL,
+    audit_write_duration_ms REAL,
+    algorithm_attribution TEXT,
+    validator_results TEXT,
+    critical_context_lost INTEGER DEFAULT 0,
+    context_retention_pct REAL DEFAULT 100,
+    quality_status TEXT,
+    task_success INTEGER,
+    fallback INTEGER DEFAULT 0,
+    fallback_reason TEXT,
+    audit_complete INTEGER DEFAULT 0,
+    passed INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES validation_runs(id)
+);
+
+-- 20. validation_events
+CREATE TABLE IF NOT EXISTS validation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    level TEXT DEFAULT 'info',
+    step TEXT,
+    scenario_id TEXT,
+    message TEXT NOT NULL,
+    data_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES validation_runs(id)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_turns_session        ON turns(session_id);
 CREATE INDEX IF NOT EXISTS idx_compressions_session ON compressions(session_id);
@@ -302,6 +381,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_usage_end ON copilot_agent_usage(event_end)
 CREATE INDEX IF NOT EXISTS idx_agent_usage_session ON copilot_agent_usage(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_debug_turns_session ON copilot_debug_turns(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_debug_turns_time ON copilot_debug_turns(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_validation_exec_run ON validation_executions(run_id);
+CREATE INDEX IF NOT EXISTS idx_validation_events_run ON validation_events(run_id, sequence);
 """
 
 # Safely add new columns to existing DBs without destroying data
