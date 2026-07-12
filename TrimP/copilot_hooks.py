@@ -16,6 +16,10 @@ def hook_file() -> Path:
     return copilot_home() / "hooks" / "TrimP.json"
 
 
+def legacy_hook_file() -> Path:
+    return copilot_home() / "hooks" / "ctopt.json"
+
+
 def build_hook_config(bridge_path: Path | None = None) -> dict:
     bridge = bridge_path or Path(__file__).resolve().parents[1] / "TrimP_hook_bridge.py"
     py = shlex.quote(sys.executable or "python3")
@@ -46,6 +50,8 @@ def install_hooks() -> Path:
     target = hook_file()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(build_hook_config(), indent=2) + "\n", encoding="utf-8")
+    # Prevent the retired ctopt hook from running alongside the TrimP hook.
+    legacy_hook_file().unlink(missing_ok=True)
     return target
 
 
@@ -55,4 +61,3 @@ def uninstall_hooks() -> bool:
         return False
     target.unlink()
     return True
-

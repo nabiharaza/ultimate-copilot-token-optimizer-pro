@@ -19,7 +19,11 @@ from pydantic import BaseModel
 
 from TrimP.db import db, get_config, DB_PATH
 from TrimP.chat_optimizer import ChatPayloadOptimizer, estimate_tokens
-from TrimP.copilot_logs import discover_events_files, parse_events_file
+from TrimP.copilot_logs import (
+    discover_events_files,
+    import_vscode_debug_sessions,
+    parse_events_file,
+)
 from TrimP.quality import score_session
 from TrimP.session import get_or_create_session, get_recent_sessions
 
@@ -37,6 +41,7 @@ app.add_middleware(
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 _AGENT_LOG_CACHE: dict[str, tuple[float, int, dict]] = {}
+_DEBUG_LOG_CACHE: dict[str, tuple[float, int, dict]] = {}
 
 
 MODEL_INPUT_PRICES_PER_1M = {
@@ -46,6 +51,16 @@ MODEL_INPUT_PRICES_PER_1M = {
     "gpt": 10.00,
     "gemini": 3.00,
     "default": 3.00,
+}
+
+MODEL_PRICING_PER_1M = {
+    "haiku": {"input": 0.80, "output": 4.00, "cached": 0.08},
+    "sonnet": {"input": 3.00, "output": 15.00, "cached": 0.30},
+    "opus": {"input": 15.00, "output": 75.00, "cached": 1.50},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00, "cached": 0.025},
+    "gpt": {"input": 1.25, "output": 10.00, "cached": 0.125},
+    "gemini": {"input": 1.25, "output": 5.00, "cached": 0.125},
+    "default": {"input": 3.00, "output": 15.00, "cached": 0.30},
 }
 
 
@@ -139,6 +154,20 @@ def _dollars_saved(tokens_saved: int, model: str | None = None) -> float:
     return round((tokens_saved / 1_000_000.0) * _model_rate(model), 6)
 
 
+def _actual_cost(input_tokens: int, output_tokens: int, cached_tokens: int, model: str | None) -> float:
+    """Estimate API-equivalent cost from exact IDE usage, not GitHub billing."""
+    name = (model or "").lower()
+    pricing = next((value for key, value in MODEL_PRICING_PER_1M.items() if key != "default" and key in name), MODEL_PRICING_PER_1M["default"])
+    cached = min(max(int(cached_tokens or 0), 0), max(int(input_tokens or 0), 0))
+    uncached = max(int(input_tokens or 0) - cached, 0)
+    return round((uncached * pricing["input"] + cached * pricing["cached"] + int(output_tokens or 0) * pricing["output"]) / 1_000_000.0, 8)
+
+
+def _pricing_for(model: str | None) -> dict[str, float]:
+    name = (model or "").lower()
+    return next((value for key, value in MODEL_PRICING_PER_1M.items() if key != "default" and key in name), MODEL_PRICING_PER_1M["default"])
+
+
 def _safe_json(value: str | None) -> dict:
     if not value:
         return {}
@@ -194,6 +223,82 @@ def _sync_agent_logs(limit: int = 200) -> int:
                     int(bool(snapshot.get("is_complete"))), datetime.now(timezone.utc).isoformat(),
                 ),
             )
+        imported += 1
+    return imported
+
+
+def _sync_debug_logs(limit: int = 200) -> int:
+    """Import per-turn IDE debug traces while retaining their full local context."""
+    imported = 0
+    for snapshot in import_vscode_debug_sessions(limit=limit):
+        source_path = str(snapshot["source_path"])
+        try:
+            stat = Path(source_path).stat()
+        except OSError:
+            continue
+        cached = _DEBUG_LOG_CACHE.get(source_path)
+        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+            continue
+        _DEBUG_LOG_CACHE[source_path] = (stat.st_mtime, stat.st_size, snapshot)
+        turns = snapshot.get("turns") or []
+        primary = [turn for turn in turns if turn.get("request_kind") == "primary"]
+        if not primary:
+            continue
+        model = primary[0].get("model") or "unknown"
+        started = snapshot.get("event_start") or datetime.now(timezone.utc).isoformat()
+        ended = snapshot.get("event_end") or started
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO sessions (id, started_at, ended_at, cwd, repository, branch,
+                   total_tokens_in, total_tokens_out, model, status, label)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?)
+                   ON CONFLICT(id) DO UPDATE SET ended_at=excluded.ended_at,
+                   cwd=excluded.cwd, repository=excluded.repository, model=excluded.model,
+                   total_tokens_in=excluded.total_tokens_in, total_tokens_out=excluded.total_tokens_out,
+                   status='completed', label=excluded.label""",
+                (
+                    snapshot["parent_session_id"], started, ended, snapshot.get("cwd"),
+                    snapshot.get("repository"), "unknown",
+                    sum(int(turn.get("input_tokens") or 0) for turn in primary),
+                    sum(int(turn.get("output_tokens") or 0) for turn in primary),
+                    model, primary[0].get("user_message") or "VS Code agent session",
+                ),
+            )
+            for turn in turns:
+                conn.execute(
+                    """INSERT INTO copilot_debug_turns (
+                       source_key, source_path, parent_session_id, child_session_id, turn_index,
+                       request_kind, occurred_at, model, debug_name, input_tokens, output_tokens,
+                       cached_tokens, total_tokens, ttft_ms, max_output_tokens, copilot_usage_nano_aiu,
+                       user_message, context_json, trace_json, cwd, repository, ide, status, imported_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(source_key) DO UPDATE SET
+                       input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+                       cached_tokens=excluded.cached_tokens, total_tokens=excluded.total_tokens,
+                       context_json=excluded.context_json, trace_json=excluded.trace_json,
+                       imported_at=excluded.imported_at""",
+                    (
+                        turn["source_key"], turn["source_path"], turn["parent_session_id"],
+                        turn.get("child_session_id"), turn.get("turn_index", 0), turn.get("request_kind"),
+                        turn.get("occurred_at"), turn.get("model"), turn.get("debug_name"),
+                        turn.get("input_tokens", 0), turn.get("output_tokens", 0), turn.get("cached_tokens", 0),
+                        turn.get("total_tokens", 0), turn.get("ttft_ms", 0), turn.get("max_output_tokens", 0),
+                        turn.get("copilot_usage_nano_aiu", 0), turn.get("user_message"), turn.get("context_json"),
+                        turn.get("trace_json"), turn.get("cwd"), turn.get("repository"), turn.get("ide"),
+                        turn.get("status"), datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            # Keep the familiar turns endpoint useful for exact primary IDE turns.
+            for turn in primary:
+                conn.execute(
+                    """INSERT INTO turns (session_id, turn_index, user_message, assistant_response,
+                       tokens_in, tokens_out, tokens_saved, model, timestamp)
+                       SELECT ?, ?, ?, '', ?, ?, 0, ?, ?
+                       WHERE NOT EXISTS (SELECT 1 FROM turns WHERE session_id=? AND turn_index=?)""",
+                    (snapshot["parent_session_id"], turn.get("turn_index", 0), turn.get("user_message", ""),
+                     turn.get("input_tokens", 0), turn.get("output_tokens", 0), turn.get("model"), turn.get("occurred_at") or started,
+                     snapshot["parent_session_id"], turn.get("turn_index", 0)),
+                )
         imported += 1
     return imported
 
@@ -317,7 +422,14 @@ async def live_health():
         from TrimP.intellij_proxy import proxy_status
         ide_proxy = proxy_status()
         services.append({"name": "IDE HTTPS proxy", "status": "up" if ide_proxy.get("running") else "down", "detail": f"127.0.0.1:{ide_proxy.get('port', 8767)}"})
-        configured = ide_proxy.get("configured_ides", [])
+        configured = list(ide_proxy.get("configured_ides", []))
+        if ide_proxy.get("vscode_configured"):
+            configured.append({
+                "product": "VS Code",
+                "path": ide_proxy.get("vscode_settings", ""),
+                "host": "127.0.0.1",
+                "port": int(ide_proxy.get("vscode_port") or ide_proxy.get("port") or 8767),
+            })
     except Exception as exc:
         configured = []
         services.append({"name": "IDE HTTPS proxy", "status": "degraded", "detail": str(exc)[:120]})
@@ -338,9 +450,10 @@ async def live_health():
 @app.post("/api/agent-logs/import")
 async def import_agent_logs():
     """Refresh exact local Copilot agent usage snapshots."""
+    from TrimP.db import prune_expired_logs
     _AGENT_LOG_CACHE.clear()
     count = _sync_agent_logs()
-    return {"imported": count, "source": str(Path.home() / ".copilot" / "session-state"), "read_only": True}
+    return {"imported": count, "source": str(Path.home() / ".copilot" / "session-state"), "read_only": True, "pruned": prune_expired_logs()}
 
 
 @app.get("/api/agent-logs/sessions")
@@ -356,6 +469,191 @@ async def agent_log_sessions(range: str = "all", limit: int = 100):
 @app.get("/api/agent-logs/usage")
 async def agent_log_usage(range: str = "day"):
     return _agent_usage_summary(_threshold_for_range(range))
+
+
+@app.get("/api/copilot/debug-sessions")
+async def copilot_debug_sessions(range: str = "day", limit: int = 50):
+    """Return parent IDE sessions with exact per-model-turn debug records."""
+    threshold = _threshold_for_range(range)
+    _sync_debug_logs()
+    with db() as conn:
+        session_rows = conn.execute(
+            """SELECT parent_session_id, MIN(occurred_at) AS started_at,
+                      MAX(occurred_at) AS ended_at, MAX(cwd) AS cwd,
+                      MAX(repository) AS repository, MAX(ide) AS ide,
+                      COUNT(*) AS request_count,
+                      SUM(CASE WHEN request_kind='primary' THEN 1 ELSE 0 END) AS model_turns,
+                      SUM(input_tokens) AS all_input_tokens, SUM(output_tokens) AS all_output_tokens,
+                      SUM(cached_tokens) AS all_cached_tokens, SUM(total_tokens) AS all_total_tokens
+               FROM copilot_debug_turns
+               WHERE COALESCE(occurred_at, imported_at) >= ?
+               GROUP BY parent_session_id
+               ORDER BY ended_at DESC LIMIT ?""",
+            (threshold, max(1, min(limit, 200))),
+        ).fetchall()
+        output = []
+        for session_row in session_rows:
+            session = dict(session_row)
+            turns = conn.execute(
+                """SELECT * FROM copilot_debug_turns
+                   WHERE parent_session_id=? ORDER BY occurred_at ASC, source_key ASC""",
+                (session["parent_session_id"],),
+            ).fetchall()
+            turn_items = []
+            primary_input = primary_output = primary_cached = primary_total = 0
+            exact_cost = primary_cost = 0.0
+            model_costs: dict[str, float] = {}
+            for row in turns:
+                item = dict(row)
+                try:
+                    item["context"] = json.loads(item.get("context_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["context"] = {}
+                try:
+                    item["trace"] = json.loads(item.get("trace_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["trace"] = {}
+                item["exact_cost_estimate"] = _actual_cost(item["input_tokens"], item["output_tokens"], item["cached_tokens"], item["model"])
+                item["uncached_input_tokens"] = max(int(item["input_tokens"] or 0) - int(item["cached_tokens"] or 0), 0)
+                item["pricing_per_million"] = _pricing_for(item["model"])
+                exact_cost += item["exact_cost_estimate"]
+                model_costs[item["model"]] = round(model_costs.get(item["model"], 0) + item["exact_cost_estimate"], 8)
+                if item["request_kind"] == "primary":
+                    primary_input += int(item["input_tokens"] or 0)
+                    primary_output += int(item["output_tokens"] or 0)
+                    primary_cached += int(item["cached_tokens"] or 0)
+                    primary_total += int(item["total_tokens"] or 0)
+                    primary_cost += item["exact_cost_estimate"]
+                # Full context is intentionally available behind an expand control.
+                item.pop("context_json", None)
+                item.pop("trace_json", None)
+                item.pop("imported_at", None)
+                turn_items.append(item)
+
+            # Correlate nearby TrimPy proxy records by repo and time. This is
+            # shown as an estimate because IDE and proxy session IDs differ.
+            trim = conn.execute(
+                """SELECT COUNT(*) AS requests, COALESCE(SUM(c.tokens_before),0) AS tokens_before,
+                          COALESCE(SUM(c.tokens_after),0) AS tokens_after,
+                          COALESCE(SUM(c.tokens_before-c.tokens_after),0) AS tokens_saved
+                   FROM compressions c LEFT JOIN sessions s ON s.id=c.session_id
+                   WHERE c.source='byok' AND c.request_source LIKE '%vscode%'
+                     AND s.repository=? AND julianday(c.compressed_at) BETWEEN julianday(?) - (30.0 / 86400.0) AND julianday(?) + (30.0 / 86400.0)""",
+                (session.get("repository"), session.get("started_at"), session.get("ended_at")),
+            ).fetchone()
+            trim = dict(trim) if trim else {"requests": 0, "tokens_before": 0, "tokens_after": 0, "tokens_saved": 0}
+            trim["savings_pct"] = round((trim["tokens_saved"] / trim["tokens_before"] * 100) if trim["tokens_before"] else 0, 2)
+            primary_model = next((item.get("model") for item in turn_items if item.get("request_kind") == "primary"), None)
+            trim["estimated_cost_saved"] = _dollars_saved(trim["tokens_saved"], primary_model or next(iter(model_costs), None))
+            output.append({
+                "session_id": session["parent_session_id"],
+                "started_at": session["started_at"],
+                "ended_at": session["ended_at"],
+                "cwd": session["cwd"],
+                "repository": session["repository"],
+                "ide": session["ide"],
+                "request_count": int(session["request_count"] or 0),
+                "model_turns": int(session["model_turns"] or 0),
+                "primary_usage": {"input_tokens": primary_input, "cached_tokens": primary_cached, "output_tokens": primary_output, "total_tokens": primary_total},
+                "all_usage": {"input_tokens": int(session["all_input_tokens"] or 0), "cached_tokens": int(session["all_cached_tokens"] or 0), "output_tokens": int(session["all_output_tokens"] or 0), "total_tokens": int(session["all_total_tokens"] or 0)},
+                "usage_source": "ide_debug_log",
+                "exact_cost_estimate": round(exact_cost, 8),
+                "primary_cost_estimate": round(primary_cost, 8),
+                "model_costs": model_costs,
+                "pricing_basis": "API-equivalent estimate from exact IDE tokens; GitHub Enterprise billing may differ",
+                "trimpy": trim,
+                "turns": turn_items,
+            })
+        # Fallback for PyCharm, Rider, and other JetBrains clients. These IDEs
+        # do not emit VS Code's JSONL Agent Debug Logs, but the HTTPS bridge
+        # still records a complete session-scoped request trace.
+        debug_ids = {item["session_id"] for item in output}
+        proxy_rows = conn.execute(
+            """SELECT c.*, s.cwd, s.repository, s.branch, s.label, s.status
+               FROM compressions c LEFT JOIN sessions s ON s.id=c.session_id
+               WHERE c.source='byok' AND c.compressed_at >= ?
+                 AND c.request_source IS NOT NULL
+                 AND (c.request_source LIKE '%pycharm%' OR c.request_source LIKE '%rider%' OR c.request_source LIKE '%jetbrains%' OR c.request_source LIKE '%vscode%')
+               ORDER BY c.compressed_at ASC""",
+            (threshold,),
+        ).fetchall()
+        proxy_groups: dict[str, list[dict]] = {}
+        for row in proxy_rows:
+            item = dict(row)
+            if item.get("session_id") in debug_ids:
+                continue
+            if "vscode" in str(item.get("request_source") or "").lower():
+                correlated = conn.execute(
+                    """SELECT 1 FROM copilot_debug_turns
+                       WHERE repository=? AND julianday(occurred_at) BETWEEN julianday(?) - (30.0 / 86400.0) AND julianday(?) + (30.0 / 86400.0)
+                       LIMIT 1""",
+                    (item.get("repository"), item.get("compressed_at"), item.get("compressed_at")),
+                ).fetchone()
+                if correlated:
+                    continue
+            proxy_groups.setdefault(str(item.get("session_id") or f"proxy-{item.get('id')}"), []).append(item)
+        for session_id, rows in proxy_groups.items():
+            first = rows[0]
+            turns = []
+            primary_input = primary_output = primary_cached = primary_total = 0
+            exact_cost = 0.0
+            model_costs: dict[str, float] = {}
+            for index, row in enumerate(rows):
+                usage = _safe_json(row.get("actual_usage"))
+                usage_details = usage.get("usage", usage) if isinstance(usage, dict) else {}
+                input_tokens = int(usage_details.get("input_tokens") or usage_details.get("prompt_tokens") or row.get("tokens_after") or 0)
+                output_tokens = int(usage_details.get("output_tokens") or usage_details.get("completion_tokens") or 0)
+                cached_tokens = int((usage_details.get("input_tokens_details") or {}).get("cached_tokens") or usage_details.get("cached_tokens") or 0)
+                observed_exact = bool(usage_details.get("input_tokens") or usage_details.get("prompt_tokens"))
+                model = str(row.get("model_used") or "unknown")
+                turn_cost = _actual_cost(input_tokens, output_tokens, cached_tokens, model)
+                exact_cost += turn_cost
+                model_costs[model] = round(model_costs.get(model, 0) + turn_cost, 8)
+                try:
+                    request_body = json.loads(row.get("request_body") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    request_body = {}
+                try:
+                    optimized_body = json.loads(row.get("optimized_body") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    optimized_body = {}
+                turns.append({
+                    "source_key": f"proxy:{row.get('id')}", "source_path": "TrimPy HTTPS proxy",
+                    "parent_session_id": session_id, "child_session_id": session_id, "turn_index": index,
+                    "request_kind": "primary", "occurred_at": row.get("compressed_at"), "model": model,
+                    "debug_name": row.get("request_source") or "IDE Copilot chat",
+                    "input_tokens": input_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens,
+                    "total_tokens": input_tokens + output_tokens, "ttft_ms": 0, "max_output_tokens": 0,
+                    "user_message": row.get("original_text") or "", "cwd": row.get("cwd"),
+                    "repository": row.get("repository"), "ide": "VS Code" if "vscode" in str(row.get("request_source")).lower() else "Rider" if "rider" in str(row.get("request_source")).lower() else "PyCharm",
+                    "status": "reported" if observed_exact else "estimated",
+                    "usage_source": "proxy_response" if observed_exact else "trimp_request_estimate",
+                    "context": {"request_body": request_body, "optimized_body": optimized_body, "debug_log": row.get("debug_log_excerpt") or ""},
+                    "trace": {"request_source": row.get("request_source"), "compression_method": row.get("compression_method"), "compression_grade": row.get("compression_grade")},
+                    "exact_cost_estimate": turn_cost, "uncached_input_tokens": max(input_tokens - cached_tokens, 0),
+                    "pricing_per_million": _pricing_for(model),
+                })
+                primary_input += input_tokens
+                primary_output += output_tokens
+                primary_cached += cached_tokens
+                primary_total += input_tokens + output_tokens
+            before = sum(int(row.get("tokens_before") or 0) for row in rows)
+            after = sum(int(row.get("tokens_after") or 0) for row in rows)
+            saved = before - after
+            model = turns[0]["model"] if turns else "unknown"
+            output.append({
+                "session_id": session_id, "started_at": first.get("compressed_at"), "ended_at": rows[-1].get("compressed_at"),
+                "cwd": first.get("cwd"), "repository": first.get("repository"), "ide": turns[0]["ide"] if turns else "JetBrains",
+                "request_count": len(turns), "model_turns": len(turns), "primary_usage": {"input_tokens": primary_input, "cached_tokens": primary_cached, "output_tokens": primary_output, "total_tokens": primary_total},
+                "all_usage": {"input_tokens": primary_input, "cached_tokens": primary_cached, "output_tokens": primary_output, "total_tokens": primary_total},
+                "exact_cost_estimate": round(exact_cost, 8), "primary_cost_estimate": round(exact_cost, 8), "model_costs": model_costs,
+                "usage_source": "ide_proxy_response" if any(turn["usage_source"] == "proxy_response" for turn in turns) else "trimp_proxy_estimate",
+                "pricing_basis": "Exact usage from proxy response when available; otherwise TrimPy sent-volume estimate. GitHub Enterprise billing may differ",
+                "trimpy": {"requests": len(rows), "tokens_before": before, "tokens_after": after, "tokens_saved": saved, "savings_pct": round(saved / before * 100, 2) if before else 0, "estimated_cost_saved": _dollars_saved(saved, model)},
+                "turns": turns,
+            })
+        output.sort(key=lambda item: item.get("ended_at") or "", reverse=True)
+    return output[: max(1, min(limit, 200))]
 
 
 @app.get("/api/copilot/summary")
@@ -1051,9 +1349,18 @@ async def get_all_config():
 
 @app.put("/api/config/{key}")
 async def set_config_api(key: str, body: dict):
-    from TrimP.db import set_config
-    set_config(key, str(body.get("value", "")))
-    return {"ok": True}
+    from TrimP.db import prune_expired_logs, set_config
+    value = str(body.get("value", ""))
+    if key == "logs.retention_months":
+        try:
+            value = str(max(0, min(120, int(value))))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Retention must be a whole number of months.")
+    set_config(key, value)
+    result = {"ok": True, "key": key, "value": value}
+    if key == "logs.retention_months":
+        result["pruned"] = prune_expired_logs()
+    return result
 
 
 @app.post("/api/test/trim")
@@ -1116,7 +1423,7 @@ async def clear_database(body: dict):
         "turns", "compressions", "sessions", "checkpoints", "quality_scores",
         "archives", "session_files", "model_routing", "token_budgets",
         "compression_patterns", "savings", "memory_audits", "loop_detections",
-        "activity_modes",
+        "activity_modes", "copilot_agent_usage",
     )
     with db() as conn:
         conn.execute("PRAGMA foreign_keys=OFF")

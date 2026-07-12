@@ -131,6 +131,27 @@ def _extract_user_prompt(body: dict[str, Any]) -> str:
     return ""
 
 
+def _request_source(flow: Any, body: dict[str, Any] | None = None) -> str:
+    """Identify the IDE without relying on the shared proxy port."""
+    headers = getattr(flow.request, "headers", {})
+    values = " ".join(
+        str(headers.get(name, ""))
+        for name in (
+            "user-agent",
+            "x-github-copilot-integration-id",
+            "x-client-name",
+            "x-editor-version",
+        )
+    ).lower()
+    if body:
+        values += " " + json.dumps(body, ensure_ascii=False).lower()
+    if "vscode" in values or "visual studio code" in values:
+        return "vscode-copilot-chat"
+    if "rider" in values:
+        return "rider-copilot-chat"
+    return "pycharm-copilot-chat"
+
+
 def _assistant_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
     if isinstance(choices, list):
@@ -238,13 +259,13 @@ def _recursive_value(value: Any, keys: tuple[str, ...], depth: int = 0) -> str:
     return ""
 
 
-def _session_id(body: dict[str, Any], prompt: str) -> str:
+def _session_id(body: dict[str, Any], prompt: str, namespace: str = "ide") -> str:
     key = _recursive_value(body, SESSION_KEYS)
     if not key:
         seed = prompt or json.dumps(body.get("model", "unknown"))
         key = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:20]
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", key).strip("-")[:120]
-    return f"jetbrains-{safe or 'chat'}"
+    return f"{namespace}-{safe or 'chat'}"
 
 
 def _git_value(cwd: str, *args: str) -> str:
@@ -275,6 +296,46 @@ def _latest_pycharm_workspace() -> str:
     return ""
 
 
+def _workspace_root(path: str) -> str:
+    candidate = Path(path).expanduser()
+    if candidate.is_file():
+        candidate = candidate.parent
+    for parent in (candidate, *candidate.parents):
+        if (parent / ".git").exists():
+            return str(parent)
+    return str(candidate)
+
+
+def _latest_vscode_workspace() -> str:
+    """Recover the active VS Code folder from its local workspace state."""
+    root = Path.home() / "Library" / "Application Support" / "Code" / "User" / "workspaceStorage"
+    transcripts = list(root.glob("*/GitHub.copilot-chat/transcripts/*.jsonl"))
+    transcripts.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    for transcript in transcripts[:8]:
+        storage = transcript.parents[2]
+        state_db = storage / "state.vscdb"
+        if not state_db.exists():
+            continue
+        try:
+            python = os.environ.get("TRIMP_PYTHON") or shutil.which("python3") or sys.executable
+            script = (
+                "import sqlite3,sys; "
+                "c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=1); "
+                "r=c.execute(\"SELECT value FROM ItemTable WHERE key='workbench.explorer.treeViewState'\").fetchone(); "
+                "print(r[0] if r and isinstance(r[0],str) else '')"
+            )
+            result = subprocess.run([python, "-c", script, str(state_db)], capture_output=True, text=True, timeout=2, check=True)
+            payload = json.loads(result.stdout.strip() or "{}")
+            focus = payload.get("focus") or payload.get("selection") or []
+            if isinstance(focus, list) and focus:
+                uri = str(focus[0]).split("::", 1)[0]
+                if uri.startswith("file://"):
+                    return _workspace_root(urllib.parse.unquote(urllib.parse.urlparse(uri).path))
+        except Exception:
+            continue
+    return ""
+
+
 def _workspace_context(body: dict[str, Any]) -> dict[str, str]:
     serialized = json.dumps(body, ensure_ascii=False)
     patterns = (
@@ -287,11 +348,14 @@ def _workspace_context(body: dict[str, Any]) -> dict[str, str]:
         if match:
             cwd = match.group(1).strip()
             break
+    is_vscode = "visual studio code" in serialized.lower() or "vscode" in serialized.lower()
+    if not cwd and is_vscode:
+        cwd = _latest_vscode_workspace()
     if not cwd:
         cwd = _latest_pycharm_workspace()
     if cwd.startswith("file://"):
         cwd = urllib.parse.unquote(urllib.parse.urlparse(cwd).path)
-    cwd = str(Path(cwd).expanduser()) if cwd else str(PROJECT_ROOT)
+    cwd = _workspace_root(str(Path(cwd).expanduser())) if cwd else str(PROJECT_ROOT)
 
     remote = _git_value(cwd, "remote", "get-url", "origin")
     repository = Path(cwd).name
@@ -442,9 +506,10 @@ class CopilotChatBridge:
         optimized, stats = self.optimizer.optimize_body(original)
         prompt = _extract_user_prompt(original)
         optimized_prompt = _extract_user_prompt(optimized)
+        request_source = _request_source(flow, original)
         workspace = _workspace_context(original)
         metadata = {
-            "session_id": _session_id(original, prompt),
+            "session_id": _session_id(original, prompt, request_source.split("-", 1)[0]),
             "model": str(original.get("model") or "unknown"),
             "stats": stats.as_dict(),
             "user_prompt": prompt,
@@ -452,7 +517,7 @@ class CopilotChatBridge:
             "request_body": original,
             "optimized_body": optimized,
             "workspace_context": workspace,
-            "request_source": "pycharm-copilot-chat",
+            "request_source": request_source,
             "host": host,
             "path": flow.request.path,
             "started_at": time.time(),
@@ -492,7 +557,8 @@ class CopilotChatBridge:
         response_body, assistant, actual_usage = _parse_response(text, content_type)
         elapsed_ms = round((time.time() - float(metadata.pop("started_at", time.time()))) * 1000)
         debug_excerpt = (
-            "JetBrains Copilot TLS bridge\n"
+            "TrimPy IDE HTTPS bridge\n"
+            f"client={metadata.get('request_source', 'ide-copilot-chat')}\n"
             f"host={metadata.pop('host')}\n"
             f"path={metadata.pop('path')}\n"
             f"status={flow.response.status_code if flow.response else 'no-response'}\n"

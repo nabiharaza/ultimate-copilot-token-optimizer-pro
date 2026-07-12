@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Database, RefreshCw, Trash2, X, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Clock3, Database, RefreshCw, Save, Trash2, X, XCircle } from 'lucide-react'
 import { useApi } from '../hooks/useApi.js'
 import { Loading } from '../components/Charts.jsx'
 
@@ -11,6 +11,7 @@ export default function Config() {
   const [confirmation, setConfirmation] = useState('')
   const [clearState, setClearState] = useState(null)
   const [health, setHealth] = useState(null)
+  const [saveMessage, setSaveMessage] = useState('')
 
   async function loadHealth() {
     const response = await fetch('/api/live-health')
@@ -28,12 +29,20 @@ export default function Config() {
   async function save(key, value) {
     setSaving(key)
     try {
-      await fetch(`/api/config/${key}`, {
+      const response = await fetch(`/api/config/${key}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value }),
       })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(result.detail || 'Could not save setting')
+      if (key === 'logs.retention_months') {
+        const deleted = result.pruned?.deleted ?? 0
+        setSaveMessage(`Retention saved. ${deleted.toLocaleString()} expired record${deleted === 1 ? '' : 's'} removed.`)
+      }
       refetch()
+    } catch (error) {
+      setSaveMessage(error.message)
     } finally {
       setSaving(null)
       setEditValues(v => { const n = {...v}; delete n[key]; return n })
@@ -63,6 +72,7 @@ export default function Config() {
     'Archive': Object.entries(config || {}).filter(([k]) => k.startsWith('archive.')),
     'Session': Object.entries(config || {}).filter(([k]) => k.startsWith('session.')),
   }
+  const retentionValue = editValues['logs.retention_months'] ?? config?.['logs.retention_months'] ?? '6'
 
   return (
     <div>
@@ -72,9 +82,22 @@ export default function Config() {
         <div className="settings-ide-health">{(health?.configured_ides || []).map(ide => <span key={ide.product}><i />{ide.product} · {ide.host}:{ide.port}</span>)}{(!health || health.configured_ides?.length === 0) && <span>No IDE integrations configured</span>}</div>
       </section>
       <section className="developer-panel">
-        <div><span className="settings-eyebrow">Release metadata</span><h2>Trim-Pilot v1.0.0</h2><p>Enterprise token optimization system</p></div>
+        <div><span className="settings-eyebrow">Release metadata</span><h2>TrimPy v1.0.0</h2><p>Enterprise token optimization system</p></div>
         <div className="release-grid"><span><b>Version</b> 1.0.0</span><span><b>Release</b> Enterprise proxy observability</span><span><b>Runtime</b> GitHub Copilot Enterprise</span></div>
         <details><summary>Developer logs and release notes</summary><pre>TrimP captures request lifecycle, repository and IDE attribution, compression decisions, model usage, cache usage, response metadata, and service health. Release focus: traceability, safe context shaping, and measured cost reduction.</pre></details>
+      </section>
+      <section className="settings-retention-panel">
+        <div className="settings-retention-copy">
+          <div className="settings-retention-icon"><Clock3 size={18} /></div>
+          <div><span className="settings-eyebrow">Privacy and storage</span><h2>Keep TrimPy logs</h2><p>Choose how long request traces, compression audits, savings history, and imported Copilot usage stay in this local workspace.</p><small>Default: 6 months. Configuration is always preserved. Choosing Forever disables automatic expiry.</small></div>
+        </div>
+        <div className="settings-retention-controls">
+          <label htmlFor="retention-months">Retention period</label>
+          <div><select id="retention-months" value={retentionValue} onChange={event => setEditValues(v => ({ ...v, 'logs.retention_months': event.target.value }))}>
+            <option value="1">1 month</option><option value="3">3 months</option><option value="6">6 months (recommended)</option><option value="12">12 months</option><option value="24">24 months</option><option value="0">Forever</option>
+          </select><button className="retention-save" onClick={() => save('logs.retention_months', retentionValue)} disabled={saving === 'logs.retention_months'}><Save size={14} />{saving === 'logs.retention_months' ? 'Saving…' : 'Save period'}</button></div>
+          {saveMessage && <span className="retention-save-message">{saveMessage}</span>}
+        </div>
       </section>
       <section className="settings-danger-zone">
         <div>

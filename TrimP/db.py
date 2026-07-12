@@ -8,7 +8,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Unified DB path — ~/.trimp/TrimP.db  (consistent across all tools, proxy, dashboard)
@@ -258,6 +258,37 @@ CREATE TABLE IF NOT EXISTS copilot_agent_usage (
     imported_at TEXT NOT NULL
 );
 
+-- 17. copilot_debug_turns
+-- Per-model-turn detail from IDE Agent Debug Logs. The parent session is kept
+-- separate from the proxy compression event so exact upstream usage and
+-- TrimPy estimates can be compared without conflating the two.
+CREATE TABLE IF NOT EXISTS copilot_debug_turns (
+    source_key TEXT PRIMARY KEY,
+    source_path TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    child_session_id TEXT,
+    turn_index INTEGER DEFAULT 0,
+    request_kind TEXT DEFAULT 'primary', -- primary | supporting
+    occurred_at TEXT,
+    model TEXT,
+    debug_name TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cached_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    ttft_ms INTEGER DEFAULT 0,
+    max_output_tokens INTEGER DEFAULT 0,
+    copilot_usage_nano_aiu INTEGER DEFAULT 0,
+    user_message TEXT,
+    context_json TEXT,
+    trace_json TEXT,
+    cwd TEXT,
+    repository TEXT,
+    ide TEXT DEFAULT 'VS Code',
+    status TEXT,
+    imported_at TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_turns_session        ON turns(session_id);
 CREATE INDEX IF NOT EXISTS idx_compressions_session ON compressions(session_id);
@@ -269,6 +300,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started     ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_compressions_compressor ON compressions(compressor);
 CREATE INDEX IF NOT EXISTS idx_agent_usage_end ON copilot_agent_usage(event_end);
 CREATE INDEX IF NOT EXISTS idx_agent_usage_session ON copilot_agent_usage(source_session_id);
+CREATE INDEX IF NOT EXISTS idx_debug_turns_session ON copilot_debug_turns(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_debug_turns_time ON copilot_debug_turns(occurred_at);
 """
 
 # Safely add new columns to existing DBs without destroying data
@@ -367,6 +400,7 @@ def insert_config_defaults() -> None:
         "proxy.port": "8765",
         "proxy.upstream": "anthropic",
         "proxy.azure_endpoint": "https://api.openai.azure.com",
+        "logs.retention_months": "6",
         "session.copilot_db_path": str(Path.home() / ".config/github-copilot/sessions.db"),
     }
     with db() as conn:
@@ -389,3 +423,66 @@ def set_config(key: str, value: str) -> None:
             "INSERT OR REPLACE INTO config(key, value, updated_at) VALUES (?,?,?)",
             (key, value, now_iso()),
         )
+
+
+def prune_expired_logs() -> dict[str, int | str | None]:
+    """Delete local telemetry older than the configured retention period.
+
+    A value of ``0`` means keep forever.  Prompt bodies and configuration are
+    intentionally outside this cleanup list; this policy only removes TrimP's
+    captured telemetry and imported Copilot usage snapshots.
+    """
+    raw_months = get_config("logs.retention_months", "6")
+    try:
+        months = max(0, min(120, int(raw_months)))
+    except (TypeError, ValueError):
+        months = 6
+    if months == 0:
+        return {"retention_months": 0, "cutoff": None, "deleted": 0}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=months * 30)
+    cutoff_iso = cutoff.isoformat()
+    timestamped_tables = {
+        "quality_scores": "scored_at",
+        "compressions": "compressed_at",
+        "archives": "archived_at",
+        "session_files": "last_seen_at",
+        "model_routing": "routed_at",
+        "token_budgets": "snapshot_at",
+        "memory_audits": "audited_at",
+        "loop_detections": "detected_at",
+        "activity_modes": "switched_at",
+        "checkpoints": "created_at",
+        "turns": "timestamp",
+        "savings": "period_end",
+    }
+    deleted = 0
+    with db() as conn:
+        for table, column in timestamped_tables.items():
+            cursor = conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff_iso,))
+            deleted += max(0, cursor.rowcount)
+        cursor = conn.execute(
+            "DELETE FROM copilot_agent_usage WHERE COALESCE(event_end, event_start, imported_at) < ?",
+            (cutoff_iso,),
+        )
+        deleted += max(0, cursor.rowcount)
+        cursor = conn.execute(
+            "DELETE FROM compression_patterns WHERE last_seen IS NOT NULL AND last_seen < ?",
+            (cutoff_iso,),
+        )
+        deleted += max(0, cursor.rowcount)
+
+        # Remove sessions only after their child telemetry has been removed.
+        # Sessions with a newer child record remain available for traceability.
+        child_tables = (
+            "turns", "checkpoints", "compressions", "quality_scores", "archives",
+            "session_files", "model_routing", "token_budgets", "memory_audits",
+            "loop_detections", "activity_modes", "savings",
+        )
+        child_exists = " OR ".join(f"EXISTS (SELECT 1 FROM {table} child WHERE child.session_id = sessions.id)" for table in child_tables)
+        cursor = conn.execute(
+            f"DELETE FROM sessions WHERE status != 'active' AND COALESCE(ended_at, started_at) < ? AND NOT ({child_exists})",
+            (cutoff_iso,),
+        )
+        deleted += max(0, cursor.rowcount)
+    return {"retention_months": months, "cutoff": cutoff_iso, "deleted": deleted}
