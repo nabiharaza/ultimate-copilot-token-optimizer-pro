@@ -28,6 +28,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from TrimP.model_utils import extract_model, normalize_copilot_model
+
 try:  # Available when mitmdump loads this file as an addon.
     from mitmproxy import ctx, http
 except ImportError:  # Lifecycle/configuration helpers do not require mitmproxy.
@@ -306,10 +308,23 @@ def _workspace_root(path: str) -> str:
     return str(candidate)
 
 
+def _vscode_user_dirs() -> list[Path]:
+    """Return VS Code user-data locations for the current operating system."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        base = home / "Library" / "Application Support"
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    return [base / name / "User" for name in ("Code", "Code - Insiders", "VSCodium")]
+
+
 def _latest_vscode_workspace() -> str:
     """Recover the active VS Code folder from its local workspace state."""
-    root = Path.home() / "Library" / "Application Support" / "Code" / "User" / "workspaceStorage"
-    transcripts = list(root.glob("*/GitHub.copilot-chat/transcripts/*.jsonl"))
+    transcripts = []
+    for user_dir in _vscode_user_dirs():
+        transcripts.extend(user_dir.glob("workspaceStorage/*/GitHub.copilot-chat/transcripts/*.jsonl"))
     transcripts.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
     for transcript in transcripts[:8]:
         storage = transcript.parents[2]
@@ -508,10 +523,20 @@ class CopilotChatBridge:
         optimized_prompt = _extract_user_prompt(optimized)
         request_source = _request_source(flow, original)
         workspace = _workspace_context(original)
+        raw_model, model_source = extract_model(original)
+        normalized_model = normalize_copilot_model(raw_model, fallback="unknown")
+        stats_payload = stats.as_dict()
+        stats_payload.update({
+            "model_raw": raw_model or None,
+            "model_normalized": normalized_model,
+            "model_source": model_source,
+        })
         metadata = {
             "session_id": _session_id(original, prompt, request_source.split("-", 1)[0]),
-            "model": str(original.get("model") or "unknown"),
-            "stats": stats.as_dict(),
+            "model": normalized_model,
+            "model_raw": raw_model or None,
+            "model_source": model_source,
+            "stats": stats_payload,
             "user_prompt": prompt,
             "optimized_prompt": optimized_prompt,
             "request_body": original,
@@ -564,6 +589,9 @@ class CopilotChatBridge:
             f"status={flow.response.status_code if flow.response else 'no-response'}\n"
             f"elapsed_ms={elapsed_ms}\n"
             f"response_bytes={len(text.encode('utf-8', errors='replace'))}\n"
+            f"model_raw={metadata.get('model_raw') or 'unavailable'}\n"
+            f"model_normalized={metadata.get('model') or 'unknown'}\n"
+            f"model_source={metadata.get('model_source') or 'unavailable'}\n"
             f"workspace={metadata['workspace_context'].get('cwd', 'unknown')}"
         )
         trace = {
@@ -775,9 +803,23 @@ def trust_ca() -> dict[str, Any]:
     }
 
 
+def _jetbrains_config_roots() -> list[Path]:
+    """Return JetBrains configuration roots on macOS, Windows, and Linux."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        roots = [home / "Library" / "Application Support" / "JetBrains"]
+    elif sys.platform == "win32":
+        roots = [Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming") / "JetBrains"]
+    else:
+        roots = [Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "JetBrains"]
+    return roots
+
+
 def _ide_config_paths() -> list[Path]:
-    root = Path.home() / "Library" / "Application Support" / "JetBrains"
-    return sorted(root.glob("*/options/github-copilot.xml"), reverse=True)
+    paths = []
+    for root in _jetbrains_config_roots():
+        paths.extend(root.glob("*/options/github-copilot.xml"))
+    return sorted(paths, key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
 
 
 def _option(component: ET.Element, name: str) -> ET.Element | None:
@@ -792,7 +834,7 @@ def _selected_config(config_path: str | None = None) -> Path:
         return path
     paths = _ide_config_paths()
     if not paths:
-        raise RuntimeError("No PyCharm GitHub Copilot settings file was found")
+        raise RuntimeError("No JetBrains GitHub Copilot settings file was found")
     return paths[0]
 
 
@@ -948,9 +990,9 @@ def configured_ides() -> list[dict[str, Any]]:
 
 
 def vscode_settings_path() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Code" / "User" / "settings.json"
-    return Path.home() / ".config" / "Code" / "User" / "settings.json"
+    """Select the first existing VS Code-family settings file, cross-platform."""
+    candidates = [user_dir / "settings.json" for user_dir in _vscode_user_dirs()]
+    return next((path for path in candidates if path.exists()), candidates[0])
 
 
 def configure_vscode(port: int = DEFAULT_PORT, settings_path: str | None = None) -> dict[str, Any]:

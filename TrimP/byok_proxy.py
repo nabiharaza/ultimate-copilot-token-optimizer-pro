@@ -27,6 +27,7 @@ from TrimP.copilot_auth import (
     get_copilot_api_token,
 )
 from TrimP.db import DB_PATH as SHARED_DB_PATH, get_connection
+from TrimP.model_utils import MODEL_ALIASES, normalize_copilot_model
 
 logger = logging.getLogger(__name__)
 
@@ -37,37 +38,6 @@ optimizer = ChatPayloadOptimizer()
 DB_PATH = str(SHARED_DB_PATH)
 CONTEXT_PATH = Path.home() / ".trimp" / "proxy_context.json"
 COPILOT_LOG_DIR = Path.home() / ".copilot" / "logs"
-
-MODEL_ALIASES = {
-    "claude haiku 4.5": "claude-haiku-4.5",
-    "claude opus 4.5": "claude-opus-4.5",
-    "claude opus 4.6": "claude-opus-4.6",
-    "claude opus 4.7": "claude-opus-4.7",
-    "claude opus 4.8": "claude-opus-4.8",
-    "claude sonnet 4.5": "claude-sonnet-4.5",
-    "claude sonnet 4.6": "claude-sonnet-4.6",
-    "claude sonnet 5": "claude-sonnet-5",
-    "gpt-5 mini": "gpt-5-mini",
-    "gpt-5.3-codex": "gpt-5.3-codex",
-    "gpt-5.4": "gpt-5.4",
-    "gpt-5.4 mini": "gpt-5.4-mini",
-    "gpt-5.5": "gpt-5.5",
-    "gemini 3.1 pro": "gemini-3.1-pro",
-    "gemini 3.5 flash": "gemini-3.5-flash",
-}
-
-
-def normalize_copilot_model(model: Any) -> str:
-    """Normalize Copilot Enterprise display names to CAPI model IDs."""
-    if not isinstance(model, str) or not model.strip():
-        return "claude-sonnet-4.6"
-    raw = model.strip()
-    lowered = raw.lower()
-    lowered = lowered.split("·", 1)[0].strip()
-    lowered = lowered.replace("medium", "").replace("high", "").replace("low", "").strip()
-    lowered = lowered.replace("(copilot)", "").strip()
-    return MODEL_ALIASES.get(lowered, raw.replace(" ", "-").lower() if " " in raw else raw)
-
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()

@@ -48,6 +48,7 @@ function ConversationDetail({ row }) {
     <tr className="conversation-detail-row">
       <td colSpan="9">
         <div className="conversation-inline-detail">
+          <div className="conversation-model-evidence"><span>Model evidence</span><p><b>IDE sent:</b> {modelName(row.model_requested || row.model_used)}</p><p><b>TrimPy ID:</b> {modelName(row.model_normalized || row.model_used)} · {row.model_source || 'proxy trace'}</p><p><b>Token source:</b> {row.usage_source === 'proxy_response' ? 'actual usage from proxy response' : 'TrimPy request estimate; upstream usage not exposed'}</p><p><b>Actual input / output / cached:</b> {row.actual_input_tokens ? `${formatNumber(row.actual_input_tokens)} / ${formatNumber(row.actual_output_tokens)} / ${formatNumber(row.actual_cached_tokens)}` : 'Not exposed in this response'}</p></div>
           <div><span>Prompt sent</span><pre>{row.prompt_preview || 'No prompt captured'}</pre></div>
           <div><span>Optimized context</span><pre>{row.optimized_preview || 'No optimized preview captured'}</pre></div>
           <div><span>Trace</span><pre>{row.debug_log_preview || 'No debug excerpt captured'}</pre></div>
@@ -63,6 +64,7 @@ export default function Sessions({ onNavigate }) {
   const [rows, setRows] = useState([])
   const [query, setQuery] = useState('')
   const [model, setModel] = useState('all')
+  const [client, setClient] = useState('all')
   const [source, setSource] = useState('all')
   const [grade, setGrade] = useState('all')
   const [filtersOpen, setFiltersOpen] = useState(false)
@@ -78,7 +80,7 @@ export default function Sessions({ onNavigate }) {
       const [response, agentResponse, debugResponse] = await Promise.all([
         fetch(`/api/copilot/conversations?range=${period}&limit=500`),
         fetch(`/api/agent-logs/sessions?range=${period}&limit=100`),
-        fetch(`/api/copilot/debug-sessions?range=${period}&limit=50`),
+        fetch(`/api/copilot/debug-sessions?range=${period}&limit=50&client=${encodeURIComponent(client)}`),
       ])
       if (response.ok) setRows(await response.json())
       if (agentResponse.ok) setAgentRows(await agentResponse.json())
@@ -94,7 +96,7 @@ export default function Sessions({ onNavigate }) {
     load()
     const timer = setInterval(load, 5000)
     return () => clearInterval(timer)
-  }, [period])
+  }, [period, client])
 
   const models = useMemo(() => [...new Set(rows.map(row => modelName(row.model_used)))].sort(), [rows])
   const sources = useMemo(() => [...new Set(rows.map(row => row.request_source || 'unknown'))].sort(), [rows])
@@ -153,7 +155,7 @@ export default function Sessions({ onNavigate }) {
         <button className="export-button" onClick={exportRows}><Download size={16} /> Export</button>
       </section>
 
-      {filtersOpen && <section className="conversation-filter-panel"><label>Client / source<select value={source} onChange={event => { setSource(event.target.value); setPage(1) }}><option value="all">All sources</option>{sources.map(value => <option key={value} value={value}>{value}</option>)}</select></label><label>Compression grade<select value={grade} onChange={event => { setGrade(event.target.value); setPage(1) }}><option value="all">All grades</option>{['A', 'B', 'C', 'D', 'F'].map(value => <option key={value} value={value}>{value}</option>)}</select></label><button className="clear-filter-button" onClick={() => { setModel('all'); setSource('all'); setGrade('all'); setQuery(''); setPage(1) }}><X size={14} /> Clear filters</button></section>}
+      {filtersOpen && <section className="conversation-filter-panel"><label>IDE client<select value={client} onChange={event => { setClient(event.target.value); setPage(1) }}><option value="all">All IDEs</option><option value="vscode">VS Code</option><option value="pycharm">PyCharm</option><option value="rider">Rider</option></select></label><label>Client / source<select value={source} onChange={event => { setSource(event.target.value); setPage(1) }}><option value="all">All sources</option>{sources.map(value => <option key={value} value={value}>{value}</option>)}</select></label><label>Compression grade<select value={grade} onChange={event => { setGrade(event.target.value); setPage(1) }}><option value="all">All grades</option>{['A', 'B', 'C', 'D', 'F'].map(value => <option key={value} value={value}>{value}</option>)}</select></label><button className="clear-filter-button" onClick={() => { setClient('all'); setModel('all'); setSource('all'); setGrade('all'); setQuery(''); setPage(1) }}><X size={14} /> Clear filters</button></section>}
 
       <section className="conversation-summary-grid">
         <SummaryCard icon={MessageSquare} label="Conversations" value={formatNumber(filtered.length)} sub="in selected period" />
@@ -173,7 +175,7 @@ export default function Sessions({ onNavigate }) {
         </div>
       </section>
 
-      <section className="agent-log-table-card"><header><div><div className="conversation-kicker"><Activity size={14} /> Exact upstream usage</div><h2>GitHub Copilot Agent Debug Logs</h2><p>Session snapshots imported from local <code>events.jsonl</code> files. Cached input, output, turns, tools, and totals are reported by Copilot.</p></div><span className="usage-source-badge reported">{agentRows.length} sessions</span></header><div className="agent-log-table-wrap"><table className="agent-log-table"><thead><tr><th>Time</th><th>Repository</th><th>Model</th><th>Input</th><th>Cached</th><th>Output</th><th>Total</th><th>Turns</th><th>Tools</th><th>Errors</th></tr></thead><tbody>{agentRows.map(row => <tr key={row.source_session_id}><td><b>{formatDate(row.event_end)}</b><small>{formatTime(row.event_end)}</small></td><td><b>{row.repository || row.cwd || 'Unknown repository'}</b><small>{row.source_session_id}</small></td><td><span className="model-pill">{modelName(row.model)}</span></td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.cached_input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td className="saved-value">{formatNumber(row.total_tokens)}</td><td>{formatNumber(row.model_turns)}</td><td>{formatNumber(row.tool_calls)}</td><td>{formatNumber(row.errors)}</td></tr>)}</tbody></table>{!agentRows.length && <div className="conversation-empty">No local agent usage snapshots found for this period.</div>}</div></section>
+      <section className="agent-log-table-card"><header><div><div className="conversation-kicker"><Activity size={14} /> Exact upstream usage</div><h2>GitHub Copilot Agent Debug Logs</h2><p>Session snapshots imported from local <code>events.jsonl</code> files. Cached input, output, turns, tools, and totals are reported by Copilot.</p></div><span className="usage-source-badge reported">{agentRows.length} sessions</span></header><div className="agent-log-table-wrap"><table className="agent-log-table"><thead><tr><th>Time</th><th>Repository</th><th>Model(s)</th><th>Input</th><th>Cached</th><th>Output</th><th>Total</th><th>Turns</th><th>Tools</th><th>Errors</th></tr></thead><tbody>{agentRows.map(row => <tr key={row.source_session_id}><td><b>{formatDate(row.event_end)}</b><small>{formatTime(row.event_end)}</small></td><td><b>{row.repository || row.cwd || 'Unknown repository'}</b><small>{row.source_session_id}</small></td><td><span className="model-pill">{modelName(row.model_label || row.model)}</span>{row.models?.length > 1 && <small className="model-mix-note">{row.models.map(modelName).join(', ')}</small>}</td><td>{formatNumber(row.input_tokens)}</td><td>{formatNumber(row.cached_input_tokens)}</td><td>{formatNumber(row.output_tokens)}</td><td className="saved-value">{formatNumber(row.total_tokens)}</td><td>{formatNumber(row.model_turns)}</td><td>{formatNumber(row.tool_calls)}</td><td>{formatNumber(row.errors)}</td></tr>)}</tbody></table>{!agentRows.length && <div className="conversation-empty">No local agent usage snapshots found for this period.</div>}</div></section>
 
       <section className="conversation-table-card">
         <table className="conversation-browser-table">

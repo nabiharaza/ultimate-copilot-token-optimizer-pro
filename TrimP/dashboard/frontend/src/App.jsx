@@ -15,13 +15,16 @@ import Feedback from './pages/Feedback.jsx'
 import LiveTest from './pages/LiveTest.jsx'
 import Alerts from './pages/Alerts.jsx'
 import ValidationCenter from './pages/ValidationCenter.jsx'
+import DarkModePrototypes from './pages/DarkModePrototypes.jsx'
 
 export default function App() {
+  if (new URLSearchParams(window.location.search).has('dark-prototypes')) return <DarkModePrototypes />
   // Persistent page state (survives refresh)
   const [page, setPage] = useState(() => {
     return localStorage.getItem('TrimP_current_page') || 'home'
   })
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('TrimP_sidebar_collapsed') === 'true')
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('TrimP_theme') !== 'light')
 
   // Save page to localStorage on change
   useEffect(() => {
@@ -31,6 +34,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('TrimP_sidebar_collapsed', String(sidebarCollapsed))
   }, [sidebarCollapsed])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? 'dark' : 'light'
+    localStorage.setItem('TrimP_theme', darkMode ? 'dark' : 'light')
+  }, [darkMode])
 
   const pages = { 
     home: OverviewDashboard,
@@ -52,10 +60,10 @@ export default function App() {
   const Page = pages[page] || HomeNew
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
-      <Sidebar active={page} onNavigate={setPage} collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(value => !value)} />
+    <div className={`app-shell ${darkMode ? 'theme-dark' : 'theme-light'} ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
+      <Sidebar active={page} onNavigate={setPage} collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(value => !value)} darkMode={darkMode} onToggleDarkMode={() => setDarkMode(value => !value)} />
       <div className="main-content" style={{ flex: 1, overflowY: 'auto' }}>
-        <Page onNavigate={setPage} />
+        <Page onNavigate={setPage} darkMode={darkMode} />
       </div>
     </div>
   )

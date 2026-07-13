@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from TrimP.copilot_logs import (
 from TrimP.quality import score_session
 from TrimP.session import get_or_create_session, get_recent_sessions
 from TrimP.validation import builtin_scenarios, mode_settings, run_scenario
+from TrimP.model_utils import normalize_copilot_model
 
 app = FastAPI(title="TrimP Dashboard", version="1.0.0")
 
@@ -183,6 +185,22 @@ def _safe_json(value: str | None) -> dict:
         return {}
 
 
+def _clean_repository(value: object, cwd: object = "") -> str:
+    """Return the repository slug, dropping Copilot workspace metadata lines."""
+    raw = str(value or "").replace("\\r\\n", "\n").replace("\\n", "\n").strip()
+    first_line = re.split(r"[\r\n]", raw, maxsplit=1)[0].strip().strip("`")
+    if not first_line or first_line.lower().startswith(("git repository root:", "* git repository root:")):
+        first_line = Path(str(cwd or "")).name if cwd else ""
+    if first_line.startswith(("/", "~/")):
+        first_line = Path(first_line).expanduser().name
+    return first_line or "unknown"
+
+
+def _clean_repository_item(item: dict) -> dict:
+    item["repository"] = _clean_repository(item.get("repository"), item.get("cwd"))
+    return item
+
+
 def _sync_agent_logs(limit: int = 200) -> int:
     """Import changed Copilot event snapshots without retaining prompt content."""
     imported = 0
@@ -217,7 +235,7 @@ def _sync_agent_logs(limit: int = 200) -> int:
                 (
                     snapshot["source_path"], snapshot["source_hash"], snapshot["session_id"],
                     snapshot.get("event_start"), snapshot.get("event_end"), snapshot.get("cwd"),
-                    snapshot.get("repository"), snapshot.get("model"), snapshot.get("copilot_version"),
+                    _clean_repository(snapshot.get("repository"), snapshot.get("cwd")), snapshot.get("model"), snapshot.get("copilot_version"),
                     snapshot.get("requests", 0), snapshot.get("user_messages", 0), snapshot.get("model_turns", 0),
                     snapshot.get("tool_calls", 0), snapshot.get("errors", 0), snapshot.get("compactions", 0),
                     snapshot.get("compaction_tokens", 0), snapshot.get("input_tokens", 0), snapshot.get("output_tokens", 0),
@@ -252,6 +270,7 @@ def _sync_debug_logs(limit: int = 200) -> int:
         model = primary[0].get("model") or "unknown"
         started = snapshot.get("event_start") or datetime.now(timezone.utc).isoformat()
         ended = snapshot.get("event_end") or started
+        clean_snapshot_repository = _clean_repository(snapshot.get("repository"), snapshot.get("cwd"))
         with db() as conn:
             conn.execute(
                 """INSERT INTO sessions (id, started_at, ended_at, cwd, repository, branch,
@@ -263,7 +282,7 @@ def _sync_debug_logs(limit: int = 200) -> int:
                    status='completed', label=excluded.label""",
                 (
                     snapshot["parent_session_id"], started, ended, snapshot.get("cwd"),
-                    snapshot.get("repository"), "unknown",
+                    clean_snapshot_repository, "unknown",
                     sum(int(turn.get("input_tokens") or 0) for turn in primary),
                     sum(int(turn.get("output_tokens") or 0) for turn in primary),
                     model, primary[0].get("user_message") or "VS Code agent session",
@@ -289,7 +308,7 @@ def _sync_debug_logs(limit: int = 200) -> int:
                         turn.get("input_tokens", 0), turn.get("output_tokens", 0), turn.get("cached_tokens", 0),
                         turn.get("total_tokens", 0), turn.get("ttft_ms", 0), turn.get("max_output_tokens", 0),
                         turn.get("copilot_usage_nano_aiu", 0), turn.get("user_message"), turn.get("context_json"),
-                        turn.get("trace_json"), turn.get("cwd"), turn.get("repository"), turn.get("ide"),
+                        turn.get("trace_json"), turn.get("cwd"), _clean_repository(turn.get("repository"), turn.get("cwd")), turn.get("ide"),
                         turn.get("status"), datetime.now(timezone.utc).isoformat(),
                     ),
                 )
@@ -503,7 +522,7 @@ async def live_health():
     services = []
     for name, url in (("BYOK proxy", "http://127.0.0.1:8766/v1/health"),):
         try:
-            response = httpx.get(url, timeout=1.5)
+            response = httpx.get(url, timeout=1.5, trust_env=False)
             payload = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
             services.append({"name": name, "status": "up" if response.status_code == 200 else "degraded", "detail": payload.get("api_url", "")})
         except Exception as exc:
@@ -551,7 +570,10 @@ async def agent_log_sessions(range: str = "all", limit: int = 100):
     threshold = _threshold_for_range(range)
     rows = _agent_log_rows(threshold, limit=max(1, min(limit, 500)))
     for row in rows:
+        row["repository"] = _clean_repository(row.get("repository"), row.get("cwd"))
         row["model_usage"] = _safe_json_list(row.get("model_usage"))
+        row["models"] = [str(item.get("model")) for item in row["model_usage"] if item.get("model")]
+        row["model_label"] = row["models"][0] if len(row["models"]) == 1 else f"Mixed ({len(row['models'])})" if row["models"] else row.get("model") or "Unknown model"
         row["source"] = "github_copilot_agent_logs"
     return rows
 
@@ -562,13 +584,22 @@ async def agent_log_usage(range: str = "day"):
 
 
 @app.get("/api/copilot/debug-sessions")
-async def copilot_debug_sessions(range: str = "day", limit: int = 50):
+async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: str = "all", repository: str = ""):
     """Return parent IDE sessions with exact per-model-turn debug records."""
     threshold = _threshold_for_range(range)
+    client = str(client or "all").lower()
+    session_filters = ["COALESCE(occurred_at, imported_at) >= ?"]
+    session_params: list[str | int] = [threshold]
+    if client not in {"", "all"}:
+        session_filters.append("lower(replace(COALESCE(ide, ''), ' ', '')) LIKE ?")
+        session_params.append(f"%{client}%")
+    if repository:
+        session_filters.append("COALESCE(repository, '') = ?")
+        session_params.append(repository)
     _sync_debug_logs()
     with db() as conn:
         session_rows = conn.execute(
-            """SELECT parent_session_id, MIN(occurred_at) AS started_at,
+            f"""SELECT parent_session_id, MIN(occurred_at) AS started_at,
                       MAX(occurred_at) AS ended_at, MAX(cwd) AS cwd,
                       MAX(repository) AS repository, MAX(ide) AS ide,
                       COUNT(*) AS request_count,
@@ -576,14 +607,14 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
                       SUM(input_tokens) AS all_input_tokens, SUM(output_tokens) AS all_output_tokens,
                       SUM(cached_tokens) AS all_cached_tokens, SUM(total_tokens) AS all_total_tokens
                FROM copilot_debug_turns
-               WHERE COALESCE(occurred_at, imported_at) >= ?
+               WHERE {' AND '.join(session_filters)}
                GROUP BY parent_session_id
                ORDER BY ended_at DESC LIMIT ?""",
-            (threshold, max(1, min(limit, 200))),
+            (*session_params, max(1, min(limit, 200))),
         ).fetchall()
         output = []
         for session_row in session_rows:
-            session = dict(session_row)
+            session = _clean_repository_item(dict(session_row))
             turns = conn.execute(
                 """SELECT * FROM copilot_debug_turns
                    WHERE parent_session_id=? ORDER BY occurred_at ASC, source_key ASC""",
@@ -594,7 +625,7 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
             exact_cost = primary_cost = 0.0
             model_costs: dict[str, float] = {}
             for row in turns:
-                item = dict(row)
+                item = _clean_repository_item(dict(row))
                 try:
                     item["context"] = json.loads(item.get("context_json") or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
@@ -658,14 +689,21 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
         # do not emit VS Code's JSONL Agent Debug Logs, but the HTTPS bridge
         # still records a complete session-scoped request trace.
         debug_ids = {item["session_id"] for item in output}
+        proxy_filters = ["c.source='byok'", "c.compressed_at >= ?", "c.request_source IS NOT NULL",
+                         "(c.request_source LIKE '%pycharm%' OR c.request_source LIKE '%rider%' OR c.request_source LIKE '%jetbrains%' OR c.request_source LIKE '%vscode%')"]
+        proxy_params: list[str | int] = [threshold]
+        if client not in {"", "all"}:
+            proxy_filters.append("lower(COALESCE(c.request_source, '')) LIKE ?")
+            proxy_params.append(f"%{client}%")
+        if repository:
+            proxy_filters.append("COALESCE(s.repository, '') = ?")
+            proxy_params.append(repository)
         proxy_rows = conn.execute(
-            """SELECT c.*, s.cwd, s.repository, s.branch, s.label, s.status
+            f"""SELECT c.*, s.cwd, s.repository, s.branch, s.label, s.status
                FROM compressions c LEFT JOIN sessions s ON s.id=c.session_id
-               WHERE c.source='byok' AND c.compressed_at >= ?
-                 AND c.request_source IS NOT NULL
-                 AND (c.request_source LIKE '%pycharm%' OR c.request_source LIKE '%rider%' OR c.request_source LIKE '%jetbrains%' OR c.request_source LIKE '%vscode%')
+               WHERE {' AND '.join(proxy_filters)}
                ORDER BY c.compressed_at ASC""",
-            (threshold,),
+            proxy_params,
         ).fetchall()
         proxy_groups: dict[str, list[dict]] = {}
         for row in proxy_rows:
@@ -684,6 +722,8 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
             proxy_groups.setdefault(str(item.get("session_id") or f"proxy-{item.get('id')}"), []).append(item)
         for session_id, rows in proxy_groups.items():
             first = rows[0]
+            for row in rows:
+                _clean_repository_item(row)
             turns = []
             primary_input = primary_output = primary_cached = primary_total = 0
             exact_cost = 0.0
@@ -695,7 +735,9 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
                 output_tokens = int(usage_details.get("output_tokens") or usage_details.get("completion_tokens") or 0)
                 cached_tokens = int((usage_details.get("input_tokens_details") or {}).get("cached_tokens") or usage_details.get("cached_tokens") or 0)
                 observed_exact = bool(usage_details.get("input_tokens") or usage_details.get("prompt_tokens"))
-                model = str(row.get("model_used") or "unknown")
+                details = _safe_json(row.get("algorithm_details"))
+                model_raw = details.get("model_raw") or str(row.get("model_used") or "")
+                model = details.get("model_normalized") or normalize_copilot_model(model_raw, fallback="unknown")
                 turn_cost = _actual_cost(input_tokens, output_tokens, cached_tokens, model)
                 exact_cost += turn_cost
                 model_costs[model] = round(model_costs.get(model, 0) + turn_cost, 8)
@@ -711,6 +753,7 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
                     "source_key": f"proxy:{row.get('id')}", "source_path": "TrimPy HTTPS proxy",
                     "parent_session_id": session_id, "child_session_id": session_id, "turn_index": index,
                     "request_kind": "primary", "occurred_at": row.get("compressed_at"), "model": model,
+                    "model_requested": model_raw or None, "model_source": details.get("model_source") or "proxy trace",
                     "debug_name": row.get("request_source") or "IDE Copilot chat",
                     "input_tokens": input_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens,
                     "total_tokens": input_tokens + output_tokens, "ttft_ms": 0, "max_output_tokens": 0,
@@ -733,7 +776,7 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50):
             model = turns[0]["model"] if turns else "unknown"
             output.append({
                 "session_id": session_id, "started_at": first.get("compressed_at"), "ended_at": rows[-1].get("compressed_at"),
-                "cwd": first.get("cwd"), "repository": first.get("repository"), "ide": turns[0]["ide"] if turns else "JetBrains",
+                "cwd": first.get("cwd"), "repository": _clean_repository(first.get("repository"), first.get("cwd")), "ide": turns[0]["ide"] if turns else "JetBrains",
                 "request_count": len(turns), "model_turns": len(turns), "primary_usage": {"input_tokens": primary_input, "cached_tokens": primary_cached, "output_tokens": primary_output, "total_tokens": primary_total},
                 "all_usage": {"input_tokens": primary_input, "cached_tokens": primary_cached, "output_tokens": primary_output, "total_tokens": primary_total},
                 "exact_cost_estimate": round(exact_cost, 8), "primary_cost_estimate": round(exact_cost, 8), "model_costs": model_costs,
@@ -863,7 +906,7 @@ async def copilot_summary(range: str = "day"):
         "measurement_note": "actual_* values come from GitHub's proxy response or local agent logs; tokens_before/after and dollars_saved are TrimP estimates",
         "last_seen": row["last_seen"],
         "model_mix": model_mix,
-        "repositories": [dict(r) for r in repo_rows],
+        "repositories": [_clean_repository_item(dict(r)) for r in repo_rows],
     }
 
 
@@ -912,7 +955,7 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
 
     conversations = []
     for row in rows:
-        item = dict(row)
+        item = _clean_repository_item(dict(row))
         saved = int(item.get("tokens_saved") or 0)
         model = item.get("model_used")
         details = _safe_json(item.get("algorithm_details"))
@@ -925,6 +968,11 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
         item["assistant_preview"] = " ".join((item.get("assistant_response") or "").split())[:240]
         item["request_source"] = item.get("request_source") or "unknown"
         item["actual_usage"] = _safe_json(item.get("actual_usage"))
+        usage_details = item["actual_usage"].get("usage", item["actual_usage"]) if isinstance(item["actual_usage"], dict) else {}
+        item["actual_input_tokens"] = int(usage_details.get("input_tokens") or usage_details.get("prompt_tokens") or 0)
+        item["actual_output_tokens"] = int(usage_details.get("output_tokens") or usage_details.get("completion_tokens") or 0)
+        item["actual_cached_tokens"] = int((usage_details.get("input_tokens_details") or {}).get("cached_tokens") or usage_details.get("cached_tokens") or 0)
+        item["usage_source"] = "proxy_response" if item["actual_input_tokens"] else "trimp_request_estimate"
         raw_recommendations = item.get("recommendations")
         try:
             parsed_recommendations = json.loads(raw_recommendations or "[]")
@@ -935,6 +983,11 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
         item["optimized_body_preview"] = (item.get("optimized_body") or "")[:4000]
         item["response_body_preview"] = (item.get("response_body") or "")[:4000]
         item["debug_log_preview"] = (item.get("debug_log_excerpt") or "")[-4000:]
+        algorithm_details = _safe_json(item.get("algorithm_details"))
+        item["model_requested"] = algorithm_details.get("model_raw") or item.get("model_used")
+        item["model_source"] = algorithm_details.get("model_source") or "proxy trace"
+        item["model_normalized"] = algorithm_details.get("model_normalized") or normalize_copilot_model(item.get("model_used"), fallback="unknown")
+        item["model_used"] = item["model_normalized"]
         conversations.append(item)
     return conversations
 
@@ -1037,7 +1090,7 @@ async def copilot_activity(range: str = "day", limit: int = 12):
         ).fetchall()
     output = []
     for row in rows:
-        item = dict(row)
+        item = _clean_repository_item(dict(row))
         details = _safe_json(item.get("algorithm_details"))
         changes = details.get("changes") if isinstance(details.get("changes"), list) else []
         item["algorithm"] = (changes[0].get("method") if changes and isinstance(changes[0], dict) else item.get("compression_method") or "no-op")
@@ -1052,7 +1105,7 @@ async def current_session():
         row = conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
     if not row:
         return {"error": "no session"}
-    return dict(row)
+    return _clean_repository_item(dict(row))
 
 
 @app.get("/api/sessions")
@@ -1090,7 +1143,7 @@ async def get_session(session_id: str):
         if not session_row:
             return {"error": "session not found"}
         
-        session = dict(session_row)
+        session = _clean_repository_item(dict(session_row))
         
         # Get turns
         turn_rows = conn.execute(
@@ -1369,16 +1422,23 @@ async def compression_patterns():
 
 
 @app.get("/api/repositories")
-async def list_repositories():
+async def list_repositories(client: str = "all"):
     """List all repositories with aggregated stats."""
+    client = str(client or "all").lower()
+    join_condition = "c.session_id = s.id AND c.source='byok'"
+    client_pattern = None
+    if client not in {"", "all"}:
+        client_pattern = f"%{client}%"
+        join_condition += " AND lower(COALESCE(c.request_source, '')) LIKE ?"
+    repo_filter = " WHERE c.id IS NOT NULL" if client_pattern else ""
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT 
                 COALESCE(s.repository, 'unknown') AS repository,
                 COUNT(DISTINCT s.branch) as branch_count,
                 COUNT(DISTINCT c.session_id) as conversation_count,
-                COUNT(*) as request_count,
+                COUNT(c.id) as request_count,
                 COALESCE(SUM(c.tokens_before), 0) as tokens_before,
                 COALESCE(SUM(c.tokens_after), 0) as tokens_after,
                 COALESCE(SUM(c.tokens_before - c.tokens_after), 0) as tokens_saved,
@@ -1386,17 +1446,18 @@ async def list_repositories():
                 AVG(c.compression_score) as avg_score,
                 MAX(c.compressed_at) as last_session,
                 GROUP_CONCAT(DISTINCT c.model_used) as models
-            FROM compressions c
-            LEFT JOIN sessions s ON s.id = c.session_id
-            WHERE c.source='byok'
+            FROM sessions s
+            LEFT JOIN compressions c ON {join_condition}
+            {repo_filter}
             GROUP BY COALESCE(s.repository, 'unknown')
             ORDER BY last_session DESC
-            """
+            """,
+            (client_pattern,) if client_pattern else (),
         ).fetchall()
         
     repositories = []
     for row in rows:
-        repo_dict = dict(row)
+        repo_dict = _clean_repository_item(dict(row))
         
         score = repo_dict.get("avg_score") or 0
         if score >= 80: avg_grade = "A"
@@ -1411,18 +1472,23 @@ async def list_repositories():
         
         # Get branches for this repo
         with db() as conn2:
+            branch_filter = ""
+            branch_params = [repo_dict['repository']]
+            if client_pattern:
+                branch_filter = " AND lower(COALESCE(c.request_source, '')) LIKE ?"
+                branch_params.append(client_pattern)
             branches = conn2.execute(
-                """
+                f"""
                 SELECT COALESCE(s.branch, 'unknown') as name,
                        COUNT(*) as requests,
                        COALESCE(SUM(c.tokens_before - c.tokens_after), 0) as tokens_saved
                 FROM compressions c
                 LEFT JOIN sessions s ON s.id = c.session_id
-                WHERE COALESCE(s.repository, 'unknown') = ?
+                WHERE c.source='byok' AND COALESCE(s.repository, 'unknown') = ?{branch_filter}
                 GROUP BY COALESCE(s.branch, 'unknown')
                 ORDER BY tokens_saved DESC
                 """,
-                (repo_dict['repository'],)
+                branch_params
             ).fetchall()
         repo_dict['branches'] = [dict(b) for b in branches]
         repositories.append(repo_dict)
@@ -1461,6 +1527,74 @@ async def validation_scenarios():
          "expected_noop": scenario.expected_noop, "fault": scenario.fault}
         for scenario in builtin_scenarios()
     ]
+
+
+@app.get("/api/validation/live-proof")
+async def validation_live_proof(client: str = "vscode", repository: str = "", hours: int = 24):
+    """Pair recent real proxy events for a live IDE A/B demonstration."""
+    client = str(client or "vscode").lower()
+    pattern = None if client in {"", "all"} else f"%{client}%"
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, min(hours, 168)))).isoformat()
+    proof_filters = ["c.source='byok'", "c.compressed_at >= ?"]
+    proof_params: list[str] = [cutoff]
+    if pattern:
+        proof_filters.append("lower(COALESCE(c.request_source,'')) LIKE ?")
+        proof_params.append(pattern)
+    if repository:
+        proof_filters.append("COALESCE(s.repository,'')=?")
+        proof_params.append(repository)
+    with db() as conn:
+        rows = conn.execute(
+            f"""SELECT c.id, c.compressed_at, c.session_id, c.request_source, c.model_used,
+                      c.tokens_before, c.tokens_after, c.original_text, c.actual_usage,
+                      c.debug_log_excerpt, s.repository, s.cwd
+               FROM compressions c LEFT JOIN sessions s ON s.id=c.session_id
+               WHERE {' AND '.join(proof_filters)}
+               ORDER BY c.compressed_at DESC LIMIT 100""",
+            proof_params,
+        ).fetchall()
+    events = []
+    for row in rows:
+        item = _clean_repository_item(dict(row))
+        prompt = str(item.get("original_text") or "").strip()
+        usage = _safe_json(item.get("actual_usage"))
+        details = usage.get("usage", usage) if isinstance(usage, dict) else {}
+        item["actual_input_tokens"] = int(details.get("input_tokens") or details.get("prompt_tokens") or 0)
+        item["actual_output_tokens"] = int(details.get("output_tokens") or details.get("completion_tokens") or 0)
+        item["actual_cached_tokens"] = int((details.get("input_tokens_details") or {}).get("cached_tokens") or details.get("cached_tokens") or 0)
+        cost_input = item["actual_input_tokens"] or int(item.get("tokens_after") or 0)
+        item["estimated_request_cost"] = _actual_cost(cost_input, item["actual_output_tokens"], item["actual_cached_tokens"], item.get("model_used"))
+        item["prompt_preview"] = " ".join(prompt.split())[:220]
+        item["prompt_hash"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12] if prompt else ""
+        item["trimpy_saved"] = max(0, int(item.get("tokens_before") or 0) - int(item.get("tokens_after") or 0))
+        item["lane"] = "trimpy_on" if item["trimpy_saved"] > 0 else "trimpy_off_or_noop"
+        algorithm_details = _safe_json(item.get("algorithm_details"))
+        item["model_requested"] = algorithm_details.get("model_raw") or item.get("model_used")
+        item["model_source"] = algorithm_details.get("model_source") or "proxy trace"
+        item.pop("actual_usage", None)
+        item.pop("original_text", None)
+        item.pop("debug_log_excerpt", None)
+        events.append(item)
+    # A defensible A/B proof uses the same prompt in both lanes. A latest-event
+    # fallback is still shown as context, but is never labeled as a paired proof.
+    by_prompt = {}
+    for item in events:
+        if item["prompt_hash"]:
+            by_prompt.setdefault(item["prompt_hash"], []).append(item)
+    pair = next((items for items in by_prompt.values()
+                 if any(item["lane"] == "trimpy_on" for item in items)
+                 and any(item["lane"] == "trimpy_off_or_noop" for item in items)), None)
+    optimized = next((item for item in (pair or events) if item["lane"] == "trimpy_on"), None)
+    baseline = next((item for item in (pair or events) if item["lane"] == "trimpy_off_or_noop"), None)
+    paired = bool(pair and optimized and baseline)
+    return {
+        "client": client, "repository": repository or (events[0].get("repository") if events else ""),
+        "paired": paired, "pair_prompt_hash": optimized.get("prompt_hash") if paired and optimized else None,
+        "baseline": baseline if paired else None, "optimized": optimized if paired else None,
+        "latest_baseline": baseline if not paired else None, "latest_optimized": optimized if not paired else None,
+        "recent_events": events[:12],
+        "proof_note": "Paired live proxy events from the selected IDE. Baseline is a TrimPy-off/no-op request; optimized is a request where the proxy removed tokens." if paired else "Send the same meaningful prompt once with TrimPy off and once with TrimPy on. Both events will appear here.",
+    }
 
 
 @app.post("/api/validation/runs")

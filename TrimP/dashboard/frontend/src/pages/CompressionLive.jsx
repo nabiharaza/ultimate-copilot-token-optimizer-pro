@@ -63,7 +63,8 @@ export default function CompressionLive() {
 
   function connectWs() {
     try {
-      const ws = new WebSocket('ws://localhost:7432/ws/live')
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/live`)
       ws.onopen    = () => setWsStatus('connected')
       ws.onclose   = () => { setWsStatus('disconnected'); setTimeout(connectWs, 3000) }
       ws.onerror   = () => setWsStatus('error')

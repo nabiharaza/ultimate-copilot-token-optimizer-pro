@@ -207,7 +207,7 @@ export default function LiveCompressionTable({ autoRefresh = true, refreshInterv
   
   const fetchCompressions = async () => {
     try {
-      const response = await fetch('http://localhost:7432/api/compressions/recent?limit=20');
+      const response = await fetch('/api/compressions/recent?limit=20');
       if (response.ok) {
         const data = await response.json();
         setCompressions(data);

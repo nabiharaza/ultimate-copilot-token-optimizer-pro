@@ -17,7 +17,7 @@ export default function ActivityFeed({ limit = 20, timeRange = 'all' }) {
 
   const fetchActivities = async () => {
     try {
-      const response = await fetch(`http://localhost:7432/api/activity/feed?limit=${limit}`);
+      const response = await fetch(`/api/activity/feed?limit=${limit}`);
       if (response.ok) {
         const data = await response.json();
         setActivities(data);

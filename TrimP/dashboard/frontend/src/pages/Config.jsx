@@ -1,7 +1,45 @@
-import { useEffect, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Clock3, Database, RefreshCw, Save, Trash2, X, XCircle } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  Activity, Archive, ArchiveRestore, Braces, Check, CheckCircle2, ChevronDown, CircleHelp,
+  Clock3, Code2, Database, Download, ExternalLink, FileArchive, FileCode2, FileJson,
+  Gauge, GitBranch, Globe2, HardDrive, Info, LockKeyhole, RefreshCw, Save, Search,
+  Server, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Tag, Terminal, Trash2,
+  WalletCards, X, XCircle, Zap,
+} from 'lucide-react'
 import { useApi } from '../hooks/useApi.js'
 import { Loading } from '../components/Charts.jsx'
+
+const FEATURE_META = {
+  'compression.bash.enabled': ['Bash/script content', 'Terminal output', 'Compresses command output while preserving errors and exit context.', Terminal],
+  'compression.search.enabled': ['Search results', 'Search results', 'Removes repeated and low-signal search lines.', Search],
+  'compression.json.enabled': ['JSON content', 'JSON content', 'Minimizes safe JSON without changing its structure.', FileJson],
+  'compression.delta.enabled': ['Delta / changes', 'Deltas/changes', 'Collapses repeated diff context around the active change.', GitBranch],
+  'compression.skeleton.enabled': ['Code skeleton', 'Code selections', 'Keeps signatures and structure while trimming implementation noise.', Code2],
+  'compression.archive.enabled': ['Archive content', 'Archives & bundles', 'Summarizes large archives and bundled artifacts before forwarding.', Archive],
+  'compression.verbosity.enabled': ['Verbose output', 'Verbose outputs', 'Removes repeated status and progress chatter from tool output.', Activity],
+  'compression.structural.enabled': ['Structural normalization', 'Structural normalization', 'Normalizes safe nested payload structure before token estimation.', Braces],
+  'compression.loop_detect.enabled': ['Loop detection', 'Loop detection', 'Stops repeated tool and retry output from inflating the next request.', RefreshCw],
+  'compression.activity.enabled': ['Activity context', 'Activity & workflow', 'Preserves the active workflow while dropping stale activity history.', Zap],
+  'compression.enabled': ['TrimPy optimization', 'Enable compression', 'Master switch for request shaping and token accounting.', SlidersHorizontal],
+  'compression.policy': ['Compression policy', 'Compression policy', 'Select the default balance between reduction and context fidelity.', SlidersHorizontal],
+}
+
+const PRICING = [
+  ['pricing.haiku_per_1m', 'Haiku', 'Claude Haiku', Sparkles, 'purple'],
+  ['pricing.sonnet_per_1m', 'Sonnet', 'Claude Sonnet', Zap, 'orange'],
+  ['pricing.opus_per_1m', 'Opus', 'Claude Opus', Globe2, 'cyan'],
+  ['pricing.gpt4_per_1m', 'GPT-4', 'GPT-4', LockKeyhole, 'slate'],
+]
+
+const ADVANCED_KEYS = ['quality.min_grade', 'proxy.port', 'proxy.upstream', 'proxy.azure_endpoint', 'session.copilot_db_path']
+
+function serviceStatus(health, name) {
+  return (health?.services || []).find(service => service.name === name)
+}
+
+function displayValue(value) {
+  return value === undefined || value === null || value === '' ? '—' : String(value)
+}
 
 export default function Config() {
   const { data: config, loading, refetch } = useApi('/api/config')
@@ -12,6 +50,8 @@ export default function Config() {
   const [clearState, setClearState] = useState(null)
   const [health, setHealth] = useState(null)
   const [saveMessage, setSaveMessage] = useState('')
+  const [search, setSearch] = useState('')
+  const [expanded, setExpanded] = useState(() => new Set())
 
   async function loadHealth() {
     const response = await fetch('/api/live-health')
@@ -24,7 +64,23 @@ export default function Config() {
     return () => clearInterval(timer)
   }, [])
 
+  const compressionEntries = Object.keys(FEATURE_META).filter(key => key.startsWith('compression.'))
+  const visibleCompression = useMemo(() => compressionEntries.filter(key => {
+    const [title, subtitle, description] = FEATURE_META[key]
+    const query = search.trim().toLowerCase()
+    return !query || `${key} ${title} ${subtitle} ${description}`.toLowerCase().includes(query)
+  }), [config, search])
+
   if (loading && !config) return <Loading />
+
+  function staged(key) {
+    return editValues[key] ?? config?.[key] ?? (key === 'compression.policy' ? 'balanced' : '')
+  }
+
+  function update(key, value) {
+    setEditValues(current => ({ ...current, [key]: String(value) }))
+    setSaveMessage('')
+  }
 
   async function save(key, value) {
     setSaving(key)
@@ -40,13 +96,30 @@ export default function Config() {
         const deleted = result.pruned?.deleted ?? 0
         setSaveMessage(`Retention saved. ${deleted.toLocaleString()} expired record${deleted === 1 ? '' : 's'} removed.`)
       }
-      refetch()
+      setEditValues(current => { const next = { ...current }; delete next[key]; return next })
+      await refetch()
+      return true
     } catch (error) {
       setSaveMessage(error.message)
+      return false
     } finally {
       setSaving(null)
-      setEditValues(v => { const n = {...v}; delete n[key]; return n })
     }
+  }
+
+  async function saveAll() {
+    const pending = Object.entries(editValues)
+    if (!pending.length) {
+      setSaveMessage('Everything is already saved.')
+      return
+    }
+    setSaving('all')
+    let savedCount = 0
+    for (const [key, value] of pending) {
+      if (await save(key, value)) savedCount += 1
+    }
+    setSaving(null)
+    setSaveMessage(`${savedCount} setting${savedCount === 1 ? '' : 's'} saved.`)
   }
 
   async function clearDatabase() {
@@ -61,110 +134,89 @@ export default function Config() {
     if (result.ok) {
       setClearState('cleared')
       setConfirmation('')
-      setTimeout(() => { setClearOpen(false); setClearState(null) }, 900)
+      setTimeout(() => { setClearOpen(false); setClearState(null); refetch() }, 900)
     } else setClearState('error')
   }
 
-  const groups = {
-    'Compression Features': Object.entries(config || {}).filter(([k]) => k.startsWith('compression.')),
-    'Pricing ($/1M tokens)': Object.entries(config || {}).filter(([k]) => k.startsWith('pricing.')),
-    'Dashboard': Object.entries(config || {}).filter(([k]) => k.startsWith('dashboard.')),
-    'Archive': Object.entries(config || {}).filter(([k]) => k.startsWith('archive.')),
-    'Session': Object.entries(config || {}).filter(([k]) => k.startsWith('session.')),
-  }
   const retentionValue = editValues['logs.retention_months'] ?? config?.['logs.retention_months'] ?? '6'
+  const allExpanded = visibleCompression.length > 0 && visibleCompression.every(key => expanded.has(key))
+  const byok = serviceStatus(health, 'BYOK proxy')
+  const ide = serviceStatus(health, 'IDE HTTPS proxy')
+  const services = [
+    { label: 'BYOK proxy', detail: byok?.detail || 'Waiting for health check', status: byok?.status || 'down', icon: Server },
+    { label: 'IDE bridge', detail: ide?.detail || 'Waiting for health check', status: ide?.status || 'down', icon: GitBranch },
+    { label: 'IDE HTTPS bridge', detail: ide?.detail || 'Waiting for health check', status: ide?.status || 'down', icon: LockKeyhole },
+  ]
+
+  function toggleExpand(key) {
+    setExpanded(current => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  function toggleAll() {
+    setExpanded(allExpanded ? new Set() : new Set(visibleCompression))
+  }
 
   return (
-    <div>
-      <section className="settings-health-panel">
-        <div className="settings-health-header"><div><h2>Live service health</h2><p>Automatic checks for every TrimP dependency and IDE bridge.</p></div><button className="icon-button" onClick={loadHealth} title="Refresh health"><RefreshCw size={16} /></button></div>
-        <div className="settings-health-grid">{(health?.services || []).map(service => <div key={service.name} className="settings-health-item"><div className="settings-health-name">{service.status === 'up' ? <CheckCircle2 size={16} /> : <XCircle size={16} />}<b>{service.name}</b></div><span>{service.status === 'up' ? service.detail || 'Running' : service.detail || 'Unavailable'}</span>{service.status !== 'up' && <small>Fix: {service.name === 'BYOK proxy' ? 'python3 byok_server.py --port 8766' : 'restart the IDE bridge and verify proxy settings'}</small>}</div>)}</div>
-        <div className="settings-ide-health">{(health?.configured_ides || []).map(ide => <span key={ide.product}><i />{ide.product} · {ide.host}:{ide.port}</span>)}{(!health || health.configured_ides?.length === 0) && <span>No IDE integrations configured</span>}</div>
-      </section>
-      <section className="developer-panel">
-        <div><span className="settings-eyebrow">Release metadata</span><h2>TrimPy v1.0.0</h2><p>Enterprise token optimization system</p></div>
-        <div className="release-grid"><span><b>Version</b> 1.0.0</span><span><b>Release</b> Enterprise proxy observability</span><span><b>Runtime</b> GitHub Copilot Enterprise</span></div>
-        <details><summary>Developer logs and release notes</summary><pre>TrimP captures request lifecycle, repository and IDE attribution, compression decisions, model usage, cache usage, response metadata, and service health. Release focus: traceability, safe context shaping, and measured cost reduction.</pre></details>
-      </section>
-      <section className="settings-retention-panel">
-        <div className="settings-retention-copy">
-          <div className="settings-retention-icon"><Clock3 size={18} /></div>
-          <div><span className="settings-eyebrow">Privacy and storage</span><h2>Keep TrimPy logs</h2><p>Choose how long request traces, compression audits, savings history, and imported Copilot usage stay in this local workspace.</p><small>Default: 6 months. Configuration is always preserved. Choosing Forever disables automatic expiry.</small></div>
-        </div>
-        <div className="settings-retention-controls">
-          <label htmlFor="retention-months">Retention period</label>
-          <div><select id="retention-months" value={retentionValue} onChange={event => setEditValues(v => ({ ...v, 'logs.retention_months': event.target.value }))}>
-            <option value="1">1 month</option><option value="3">3 months</option><option value="6">6 months (recommended)</option><option value="12">12 months</option><option value="24">24 months</option><option value="0">Forever</option>
-          </select><button className="retention-save" onClick={() => save('logs.retention_months', retentionValue)} disabled={saving === 'logs.retention_months'}><Save size={14} />{saving === 'logs.retention_months' ? 'Saving…' : 'Save period'}</button></div>
-          {saveMessage && <span className="retention-save-message">{saveMessage}</span>}
-        </div>
-      </section>
-      <section className="settings-danger-zone">
+    <main className="settings-page">
+      <header className="settings-page-header">
         <div>
-          <div className="settings-danger-title"><Database size={17} /> Telemetry database</div>
-          <p>Remove captured conversations, traces, quality scores, and savings history. Configuration is preserved.</p>
+          <div className="settings-page-kicker"><Settings2 size={14} /> Administration</div>
+          <h1>Settings</h1>
+          <p>Configure your TrimPy environment and system behavior.</p>
         </div>
-        <button className="danger-button" onClick={() => setClearOpen(true)} title="Clear database">
-          <Trash2 size={15} /> Clear DB
-        </button>
+        <div className="settings-header-actions">
+          <label className="settings-search"><Search size={15} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search settings…" aria-label="Search settings" /><kbd>⌘ K</kbd></label>
+          <span className="settings-environment"><i /> Production</span>
+          <button className="settings-save-all" onClick={saveAll} disabled={saving === 'all'}><Check size={15} /> {saving === 'all' ? 'Saving…' : 'Save changes'}</button>
+        </div>
+      </header>
+
+      <section className="settings-top-grid">
+        <article className="settings-health-panel settings-card">
+          <div className="settings-section-heading"><div><h2><Activity size={16} /> Live service health</h2><p>Automatic checks for every TrimPy dependency and IDE bridge.</p></div><button className="icon-button" onClick={loadHealth} title="Refresh health"><RefreshCw size={16} /></button></div>
+          <div className="settings-service-grid">{services.map(service => { const Icon = service.icon; const up = service.status === 'up'; return <div className={`settings-service-card ${up ? 'up' : 'down'}`} key={service.label}><div className="settings-service-name"><span>{up ? <CheckCircle2 size={15} /> : <XCircle size={15} />} </span><b>{service.label}</b></div><small>{service.detail}</small><em><i /> {up ? 'Working in real time' : 'Needs attention'}</em></div> })}</div>
+          <div className="settings-ide-health">{(health?.configured_ides || []).map(ideItem => <span key={ideItem.product}><i />{ideItem.product} <b>•</b> {ideItem.host}:{ideItem.port}</span>)}{(!health || health.configured_ides?.length === 0) && <span>No IDE integrations configured</span>}</div>
+        </article>
+
+        <article className="settings-release-card settings-card">
+          <div className="settings-section-heading"><div><h2><Database size={16} /> Release metadata</h2></div></div>
+          <div className="settings-release-hero"><strong>TrimPy v1.0.0</strong><span>Enterprise token optimization system</span><div><b>Version 1.0.0</b><b>Observability</b><b>GitHub Copilot Enterprise</b><b>Proxy</b></div></div>
+          <div className="settings-release-copy"><b>Developer logs and release notes</b><p>TrimPy captures request lifecycle, repository and IDE attribution, compression decisions, token usage, response metadata, and service health. Release focus: traceability, safe context shaping, and measured cost reduction.</p></div>
+        </article>
+
+        <article className="settings-privacy-card settings-card">
+          <div className="settings-section-heading"><div><h2><ShieldCheck size={16} /> Privacy & storage</h2></div></div>
+          <b className="settings-card-title">Keep TrimPy logs</b>
+          <p>Choose how long request traces, compression audits, savings history, and imported Copilot usage stay in this local workspace.</p>
+          <small>Default: 6 months. Configuration is always preserved.</small>
+          <label className="settings-field-label" htmlFor="retention-months">Retention period</label>
+          <div className="settings-retention-controls"><select id="retention-months" value={retentionValue} onChange={event => update('logs.retention_months', event.target.value)}><option value="1">1 month</option><option value="3">3 months</option><option value="6">6 months (recommended)</option><option value="12">12 months</option><option value="24">24 months</option><option value="0">Forever</option></select><button className="retention-save" onClick={() => save('logs.retention_months', retentionValue)} disabled={saving === 'logs.retention_months'}><Save size={14} /> Save period</button></div>
+          {saveMessage && <span className="settings-save-message">{saveMessage}</span>}
+        </article>
       </section>
-      {clearOpen && (
-        <div className="confirm-backdrop" role="dialog" aria-modal="true" aria-label="Clear database confirmation">
-          <section className="confirm-dialog">
-            <button className="confirm-close" onClick={() => setClearOpen(false)} title="Close"><X size={17} /></button>
-            <div className="confirm-icon"><AlertTriangle size={22} /></div>
-            <h2>Clear DB?</h2>
-            <p>This permanently deletes all captured conversations, traces, quality scores, and savings data. This cannot be undone.</p>
-            <label>Type <strong>CLEAR DB</strong> to confirm</label>
-            <input autoFocus value={confirmation} onChange={e => setConfirmation(e.target.value)} placeholder="CLEAR DB" />
-            <div className="confirm-actions">
-              <button className="secondary-button" onClick={() => setClearOpen(false)}>Cancel</button>
-              <button className="danger-button" disabled={confirmation !== 'CLEAR DB' || clearState === 'clearing'} onClick={clearDatabase}>
-                {clearState === 'clearing' ? 'Clearing…' : clearState === 'cleared' ? 'Cleared' : 'Clear DB'}
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
-      {Object.entries(groups).map(([group, entries]) => entries.length === 0 ? null : (
-        <div key={group} className="card">
-          <h2>{group}</h2>
-          <table>
-            <thead><tr><th>Key</th><th>Value</th><th>Action</th></tr></thead>
-            <tbody>
-              {entries.map(([key, val]) => {
-                const editVal = editValues[key] ?? val
-                const isBool = val === 'true' || val === 'false'
-                return (
-                  <tr key={key}>
-                    <td style={{ fontFamily: 'monospace', color: 'var(--accent)', fontSize: '0.82rem' }}>{key}</td>
-                    <td>
-                      {isBool ? (
-                        <select value={editVal} onChange={e => setEditValues(v => ({...v, [key]: e.target.value}))}
-                          style={{ background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}>
-                          <option value="true">true</option>
-                          <option value="false">false</option>
-                        </select>
-                      ) : (
-                        <input value={editVal} onChange={e => setEditValues(v => ({...v, [key]: e.target.value}))}
-                          style={{ background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px', width: '160px' }} />
-                      )}
-                    </td>
-                    <td>
-                      {editValues[key] !== undefined && editValues[key] !== val && (
-                        <button onClick={() => save(key, editValues[key])} disabled={saving === key}
-                          style={{ background: 'var(--green)', color: '#000', border: 'none', borderRadius: 4, padding: '3px 10px', cursor: 'pointer', fontSize: '0.8rem' }}>
-                          {saving === key ? '…' : 'Save'}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      ))}
-    </div>
+
+      <section className="settings-danger-zone settings-card"><div><div className="settings-danger-title"><Trash2 size={17} /> Telemetry database</div><p>Remove captured conversations, traces, quality scores, and savings history. Configuration is preserved.</p></div><button className="danger-button" onClick={() => setClearOpen(true)}><Trash2 size={15} /> Clear DB</button></section>
+
+      <section className="settings-features-card settings-card">
+        <div className="settings-section-heading"><div><h2><SlidersHorizontal size={16} /> Compression Features</h2><p>Control how TrimPy compresses and optimizes context before it is sent to models.</p></div><button className="settings-expand-all" onClick={toggleAll}><ChevronDown size={15} /> {allExpanded ? 'Collapse all' : 'Expand all'}</button></div>
+        <div className="settings-feature-grid">{visibleCompression.map(key => { const [title, subtitle, description, Icon] = FEATURE_META[key]; const enabled = staged(key) === 'true'; return <div className={`settings-feature-row ${expanded.has(key) ? 'is-expanded' : ''}`} key={key}><span className="settings-feature-icon"><Icon size={15} /></span><div className="settings-feature-copy"><b>{key}</b><small>{subtitle}</small>{expanded.has(key) && <p>{description}</p>}</div>{key === 'compression.policy' ? <select value={staged(key)} onChange={event => update(key, event.target.value)}><option value="conservative">conservative</option><option value="balanced">balanced</option><option value="aggressive">aggressive</option></select> : <button className={`settings-toggle ${enabled ? 'on' : ''}`} role="switch" aria-checked={enabled} aria-label={`${enabled ? 'Disable' : 'Enable'} ${title}`} onClick={() => update(key, enabled ? 'false' : 'true')}><i /></button>}<button className="settings-row-expand" onClick={() => toggleExpand(key)} aria-label={`Show details for ${title}`}><ChevronDown size={14} /></button></div> })}</div>
+      </section>
+
+      <section className="settings-bottom-grid">
+        <article className="settings-card settings-pricing-card"><div className="settings-section-heading"><div><h2><Tag size={16} /> Pricing ($ / 1M tokens)</h2><p>Set the per-1M token pricing used for cost estimation.</p></div></div>{PRICING.map(([key, label, model, Icon, tone]) => <label className="settings-pricing-row" key={key}><span className={`settings-pricing-icon ${tone}`}><Icon size={14} /></span><b title={model}>{label}</b><input value={staged(key)} onChange={event => update(key, event.target.value)} aria-label={`${model} price per 1M tokens`} /></label>)}</article>
+        <article className="settings-card settings-dashboard-card"><div className="settings-section-heading"><div><h2><Gauge size={16} /> Dashboard</h2><p>Configure local dashboard behavior.</p></div></div><div className="settings-inline-fields"><label><b>dashboard.web_port</b><small>Port for the TrimPy dashboard</small></label><input value={staged('dashboard.web.port')} onChange={event => update('dashboard.web.port', event.target.value)} /></div><div className="settings-inline-fields"><label><b>dashboard.web_auto_open</b><small>Open dashboard automatically</small></label><button className={`settings-toggle ${staged('dashboard.web.auto_open') === 'true' ? 'on' : ''}`} role="switch" aria-checked={staged('dashboard.web.auto_open') === 'true'} onClick={() => update('dashboard.web.auto_open', staged('dashboard.web.auto_open') === 'true' ? 'false' : 'true')}><i /></button></div></article>
+        <article className="settings-card settings-archive-card"><div className="settings-section-heading"><div><h2><ArchiveRestore size={16} /> Archive</h2><p>Archive and export configuration.</p></div></div><div className="settings-archive-box"><span className="settings-archive-icon"><Download size={17} /></span><div><b>Archive settings and telemetry (export)</b><small>Download a snapshot of your configuration and telemetry for backup or migration.</small></div><button className="settings-outline-action" onClick={() => setSaveMessage('Archive export is available from the local database tooling.')}>Create archive</button></div><label className="settings-archive-threshold"><span>Archive threshold (characters)</span><input value={staged('archive.threshold_chars')} onChange={event => update('archive.threshold_chars', event.target.value)} /></label></article>
+      </section>
+
+      <details className="settings-advanced-card settings-card"><summary><FileCode2 size={16} /><span><b>Advanced configuration</b><small>Proxy, quality, session database, and other low-level controls.</small></span><ChevronDown size={16} /></summary><div className="settings-advanced-grid">{ADVANCED_KEYS.map(key => <label key={key}><b>{key}</b><input value={staged(key)} onChange={event => update(key, event.target.value)} /></label>)}</div></details>
+      <footer className="settings-footer"><LockKeyhole size={16} /><span>All settings are stored securely on your machine and never leave your environment.</span><a href="#system" onClick={() => window.location.hash = '#system'}>View documentation <ExternalLink size={13} /></a></footer>
+
+      {clearOpen && <div className="confirm-backdrop" role="dialog" aria-modal="true" aria-label="Clear database confirmation"><section className="confirm-dialog"><button className="confirm-close" onClick={() => setClearOpen(false)} title="Close"><X size={17} /></button><div className="confirm-icon"><Info size={22} /></div><h2>Clear DB?</h2><p>This permanently deletes all captured conversations, traces, quality scores, and savings data. This cannot be undone.</p><label>Type <strong>CLEAR DB</strong> to confirm</label><input autoFocus value={confirmation} onChange={event => setConfirmation(event.target.value)} placeholder="CLEAR DB" /><div className="confirm-actions"><button className="secondary-button" onClick={() => setClearOpen(false)}>Cancel</button><button className="danger-button" disabled={confirmation !== 'CLEAR DB' || clearState === 'clearing'} onClick={clearDatabase}>{clearState === 'clearing' ? 'Clearing…' : clearState === 'cleared' ? 'Cleared' : 'Clear DB'}</button></div></section></div>}
+    </main>
   )
 }

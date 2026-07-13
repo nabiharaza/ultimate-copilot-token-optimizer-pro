@@ -25,14 +25,14 @@ export default function Dashboard() {
   const fetchData = async () => {
     try {
       // Fetch current session stats
-      const sessionRes = await fetch('http://localhost:7432/api/session/current');
+      const sessionRes = await fetch('/api/session/current');
       if (sessionRes.ok) {
         const sessionData = await sessionRes.json();
         setStats(sessionData);
       }
 
       // Fetch model stats
-      const modelRes = await fetch(`http://localhost:7432/api/models/stats?range=${timeRange}`);
+      const modelRes = await fetch(`/api/models/stats?range=${timeRange}`);
       if (modelRes.ok) {
         const modelData = await modelRes.json();
         setModelStats(modelData);

@@ -18,7 +18,7 @@ export default function CompressionMethodCards() {
 
   const fetchMethods = async () => {
     try {
-      const response = await fetch('http://localhost:7432/api/compression/methods');
+      const response = await fetch('/api/compression/methods');
       if (response.ok) {
         const data = await response.json();
         setMethods(data);

@@ -1,4 +1,4 @@
-import { Activity, Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Settings, ShieldCheck, SlidersHorizontal } from 'lucide-react'
+import { Activity, Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Moon, Settings, ShieldCheck, SlidersHorizontal, Sun } from 'lucide-react'
 import { useState } from 'react'
 
 const SIDEBAR_ITEMS = [
@@ -11,7 +11,7 @@ const SIDEBAR_ITEMS = [
   { section: 'Insights' },
   { id: 'sessions', icon: MessageSquare, label: 'Conversations' },
   { id: 'live', icon: Activity, label: 'Live activity' },
-  { id: 'demo', icon: FlaskConical, label: 'Experiments' },
+  { id: 'demo', icon: FlaskConical, label: 'A/B preflight' },
   { id: 'validation', icon: ShieldCheck, label: 'Validation' },
   { section: 'Admin' },
   { id: 'diff', icon: FileDiff, label: 'Diff review' },
@@ -20,7 +20,7 @@ const SIDEBAR_ITEMS = [
   { id: 'settings', icon: Settings, label: 'Settings' },
 ]
 
-export default function Sidebar({ active, onNavigate, collapsed, onToggle }) {
+export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkMode, onToggleDarkMode }) {
   const [brandClicks, setBrandClicks] = useState(0)
   const [secretOpen, setSecretOpen] = useState(false)
 
@@ -57,6 +57,7 @@ export default function Sidebar({ active, onNavigate, collapsed, onToggle }) {
       </nav>
       {secretOpen && <div className="sidebar-secret" role="status"><b>TrimPy unlocked</b><span>Cut the noise. Keep the signal.</span></div>}
       <div className="sidebar-footer">
+        <button className="theme-toggle" onClick={onToggleDarkMode} aria-label={darkMode ? 'Use light mode' : 'Use dark mode'} title={darkMode ? 'Use light mode' : 'Use dark mode'}><span className="theme-toggle-icon">{darkMode ? <Sun size={17} /> : <Moon size={17} />}</span><span>{darkMode ? 'Light mode' : 'Dark mode'}</span></button>
         <div className="avatar" aria-label="Trim-Pilot operator">
           TP
           <span className="avatar-dot" />

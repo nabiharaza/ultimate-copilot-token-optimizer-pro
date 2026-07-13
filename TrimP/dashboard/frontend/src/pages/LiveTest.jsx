@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { BookOpen, CheckCircle2, ChevronDown, Clock3, FileText, FlaskConical, Gauge, LockKeyhole, Power, RefreshCw, ShieldCheck, Sparkles, ToggleLeft, ToggleRight, Wrench, Zap } from 'lucide-react'
+import { BookOpen, CheckCircle2, ChevronDown, Clock3, FileText, FlaskConical, Gauge, LockKeyhole, Power, RefreshCw, ShieldCheck, Sparkles, Wrench, Zap } from 'lucide-react'
+import TestGuide from '../components/TestGuide.jsx'
+import TrimPSwitch, { useTrimPEnabled } from '../components/TrimPSwitch.jsx'
 
 const DEMO_MESSAGE = `Review the current repository and explain how the request pipeline works. Keep the important constraints, identify the main files, summarize the repeated tool output below, and suggest the safest next steps.
 
@@ -23,10 +25,9 @@ const TEST_CASES = [
 function number(value) { return Number(value || 0).toLocaleString() }
 function pct(value) { return `${Number(value || 0).toFixed(2)}%` }
 function localTime(value) { return value ? new Date(value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '—' }
-function cleanRepository(value) { return String(value || 'unknown').split(/\r?\n/)[0].trim() || 'unknown' }
+function cleanRepository(value) { const normalized = String(value || '').replace(/\\r?\\n/g, '\n'); return normalized.split(/\r?\n/)[0].trim() || 'unknown' }
 
 export default function LiveTest() {
-  const [enabled, setEnabled] = useState(true)
   const [repositories, setRepositories] = useState([])
   const [repository, setRepository] = useState('unassigned')
   const [testCase, setTestCase] = useState(TEST_CASES[0].id)
@@ -37,16 +38,13 @@ export default function LiveTest() {
   const [error, setError] = useState('')
   const [statusMessage, setStatusMessage] = useState('Choose a repository and test case, then run the A/B test.')
   const [runHistory, setRunHistory] = useState(() => { try { return JSON.parse(localStorage.getItem('TrimP_test_runs') || '[]') } catch { return [] } })
+  const { enabled, setEnabled, saving, error: optimizerError } = useTrimPEnabled()
 
   const selectedCase = useMemo(() => TEST_CASES.find(item => item.id === testCase) || TEST_CASES[0], [testCase])
 
   useEffect(() => {
-    Promise.all([
-      fetch('/api/config').then(response => response.json()),
-      fetch('/api/repositories').then(response => response.ok ? response.json() : []),
-    ]).then(([config, repositoryPayload]) => {
+    fetch('/api/repositories').then(response => response.ok ? response.json() : []).then(repositoryPayload => {
       const repoRows = Array.isArray(repositoryPayload) ? repositoryPayload : (repositoryPayload.repositories || [])
-      setEnabled(String(config['compression.enabled'] ?? 'true') === 'true')
       const cleanedRows = repoRows.map(repo => ({ ...repo, repository: cleanRepository(repo.repository) }))
       setRepositories(cleanedRows)
       if (cleanedRows?.[0]?.repository) setRepository(cleanedRows[0].repository)
@@ -62,9 +60,8 @@ export default function LiveTest() {
   }
 
   async function setOptimizer(value) {
-    setEnabled(value)
-    const response = await fetch('/api/config/compression.enabled', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: String(value) }) })
-    setStatusMessage(response.ok ? `TrimPy is now ${value ? 'on and optimizing eligible requests.' : 'off and forwarding requests unchanged.'}` : 'Could not update the TrimPy switch.')
+    const result = await setEnabled(value)
+    setStatusMessage(result.ok ? `TrimPy is now ${value ? 'on and optimizing eligible requests.' : 'off and forwarding requests unchanged.'}` : `Could not update the TrimPy switch: ${result.error}`)
   }
 
   async function runCase(value) {
@@ -108,9 +105,10 @@ export default function LiveTest() {
   }
 
   return <main className="live-test-page">
-    <header className="live-test-header"><div><div className="conversation-kicker"><FlaskConical size={15} /> Evidence lab</div><h1>Test TrimPy live</h1><p>Run repeatable A/B cases by repository and keep a local record of what happened.</p></div><div className="live-test-header-actions"><button className="test-button primary" onClick={runAB} disabled={!!running}><Sparkles size={15} /> {running ? 'Testing…' : 'One-click A/B test'}</button><div className={`optimizer-switch ${enabled ? 'is-on' : 'is-off'}`}><span className="optimizer-switch-label"><Power size={15} /> TrimPy {enabled ? 'on' : 'off'}</span><button onClick={() => setOptimizer(!enabled)} aria-label={`Turn TrimPy ${enabled ? 'off' : 'on'}`} title={`Turn TrimPy ${enabled ? 'off' : 'on'}`}>{enabled ? <ToggleRight size={30} /> : <ToggleLeft size={30} />}</button></div></div></header>
+    <header className="live-test-header"><div><div className="conversation-kicker"><FlaskConical size={15} /> A/B preflight</div><h1>Compare TrimPy on and off</h1><p>Offline request-body evidence for a quick demo. Use Validation for repeatable suites and Live IDE proof for actual proxy traffic.</p></div><div className="live-test-header-actions"><button className="test-button primary" onClick={runAB} disabled={!!running}><Sparkles size={15} /> {running ? 'Testing…' : 'One-click A/B test'}</button><TrimPSwitch enabled={enabled} onToggle={setOptimizer} saving={saving} /></div></header>
 
-    <section className="live-test-notice"><ShieldCheck size={18} /><div><b>Safe local test</b><span>This test measures the request body only. It does not contact GitHub or consume Copilot quota.</span><small>{statusMessage}</small></div><LockKeyhole size={16} /></section>
+    <section className={`live-test-notice ${enabled ? '' : 'is-off'}`}><ShieldCheck size={18} /><div><b>{enabled ? 'Safe local test' : 'TrimPy off · pass-through mode'}</b><span>This test measures the request body only. It does not contact GitHub or consume Copilot quota.</span><small>{optimizerError || statusMessage}</small></div><LockKeyhole size={16} /></section>
+    <TestGuide mode="preflight" />
     <section className="test-selection-bar"><label><span><GitRepoIcon /> Repository</span><select value={repository} onChange={event => setRepository(event.target.value)}><option value="unassigned">Unassigned / local test</option>{repositories.map(repo => <option key={repo.repository} value={repo.repository}>{repo.repository}</option>)}</select></label><label><span><FlaskConical size={14} /> Test case</span><select value={testCase} onChange={event => chooseCase(event.target.value)}>{TEST_CASES.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><div className="test-case-description"><b>{selectedCase.label}</b><span>{selectedCase.description}</span></div></section>
 
     <section className="live-test-layout"><div className="live-test-input glass-card"><div className="live-test-section-heading"><div><h2>Chat message to test</h2><p>Edit the selected case or restore its documented default.</p></div><button className="icon-button" onClick={() => setMessage(selectedCase.message)} title="Restore selected test case"><RefreshCw size={15} /></button></div><textarea value={message} onChange={event => setMessage(event.target.value)} /><div className="live-test-actions"><button className="test-button baseline" onClick={() => runCase(false)} disabled={!!running}><Power size={15} /> Run off only</button><button className="test-button optimized" onClick={() => runCase(true)} disabled={!!running}><Zap size={15} /> Run on only</button><button className="test-button primary" onClick={runAB} disabled={!!running}><Sparkles size={15} /> Run documented A/B</button></div>{error && <div className="live-test-error">{error}</div>}</div><div className="live-test-explainer glass-card"><div className="live-test-section-heading"><div><h2>How this is verified</h2><p>Every run follows the same calculation.</p></div><Gauge size={19} /></div><ol><li><b>Off baseline</b><span>Optimizer bypassed; before and after must match.</span></li><li><b>On comparison</b><span>Same repository, case, model, and message are optimized.</span></li><li><b>Delta</b><span>Saved = baseline after − optimized after.</span></li><li><b>Evidence</b><span>Repository, timestamp, grade, and algorithms are recorded below.</span></li></ol><small>These are local request preflight signals. Actual model answer quality requires an upstream Copilot comparison.</small></div></section>
