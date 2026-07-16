@@ -23,7 +23,7 @@ from TrimP.compression.advanced import (
 )
 
 
-def test_code_context_trimmer():
+def _check_code_context_trimmer():
     """Test CodeContextTrimmer accuracy."""
     code = """import os
 import sys
@@ -70,7 +70,12 @@ def main():
     return "✓", metadata['savings_pct']
 
 
-def test_conversation_compressor():
+def test_code_context_trimmer():
+    """pytest entry point; real assertions live in _check_code_context_trimmer()."""
+    _check_code_context_trimmer()
+
+
+def _check_conversation_compressor():
     """Test ConversationCompressor accuracy."""
     messages = [
         {'role': 'user', 'content': 'I want to build a Kubernetes monitoring dashboard.'},
@@ -95,7 +100,12 @@ def test_conversation_compressor():
     return "✓", metadata['savings_pct']
 
 
-def test_json_minimizer():
+def test_conversation_compressor():
+    """pytest entry point; real assertions live in _check_conversation_compressor()."""
+    _check_conversation_compressor()
+
+
+def _check_json_minimizer():
     """Test JSONMinimizer accuracy."""
     json_data = """{
         "users": [
@@ -122,7 +132,12 @@ def test_json_minimizer():
     return "✓", metadata['savings_pct']
 
 
-def test_log_extractor():
+def test_json_minimizer():
+    """pytest entry point; real assertions live in _check_json_minimizer()."""
+    _check_json_minimizer()
+
+
+def _check_log_extractor():
     """Test LogExtractor accuracy."""
     log = """2026-06-29 12:00:00 INFO Starting application
 2026-06-29 12:00:01 DEBUG Loading configuration
@@ -151,7 +166,12 @@ def test_log_extractor():
     return "✓", metadata['savings_pct']
 
 
-def test_image_description_reducer():
+def test_log_extractor():
+    """pytest entry point; real assertions live in _check_log_extractor()."""
+    _check_log_extractor()
+
+
+def _check_image_description_reducer():
     """Test ImageDescriptionReducer accuracy."""
     description = """This screenshot shows a web application dashboard. The interface has a dark blue navigation bar at the top with white text. On the left side, there's a vertical sidebar containing menu items including "Dashboard", "Analytics", "Reports", and "Settings". The main content area displays a grid of cards showing various metrics: total users (1,234), active sessions (567), revenue ($12,345), and conversion rate (3.2%). Each card has a light gray background with black text and green accent colors for positive trends. At the bottom right, there's an orange "Export" button and a blue "Refresh" button. The overall color scheme uses shades of blue, gray, and white with accent colors of green and orange."""
     
@@ -167,7 +187,12 @@ def test_image_description_reducer():
     return "✓", metadata['savings_pct']
 
 
-def test_architecture_context_packer():
+def test_image_description_reducer():
+    """pytest entry point; real assertions live in _check_image_description_reducer()."""
+    _check_image_description_reducer()
+
+
+def _check_architecture_context_packer():
     """Test ArchitectureContextPacker accuracy."""
     architecture = """Our system consists of several microservices:
     
@@ -191,7 +216,12 @@ The ReportService generates reports. It uses getReport() and scheduleReport() me
     return "✓", metadata['savings_pct']
 
 
-def test_semantic_chunker():
+def test_architecture_context_packer():
+    """pytest entry point; real assertions live in _check_architecture_context_packer()."""
+    _check_architecture_context_packer()
+
+
+def _check_semantic_chunker():
     """Test SemanticChunker accuracy."""
     document = """Kubernetes is an open-source container orchestration platform. It automates deployment, scaling, and management of containerized applications.
 
@@ -219,7 +249,12 @@ Namespaces provide logical separation within a cluster. They're useful for multi
     return "✓", metadata['savings_pct']
 
 
-def test_llm_lingua_lite():
+def test_semantic_chunker():
+    """pytest entry point; real assertions live in _check_semantic_chunker()."""
+    _check_semantic_chunker()
+
+
+def _check_llm_lingua_lite():
     """Test LLMLinguaLite accuracy."""
     text = """I was actually wondering if maybe you could possibly help me understand how the authentication system works in this application. I'm particularly interested in learning about the token validation process and how it handles expired tokens."""
     
@@ -234,7 +269,12 @@ def test_llm_lingua_lite():
     return "✓", metadata['savings_pct']
 
 
-def test_mcp_tool_trimmer():
+def test_llm_lingua_lite():
+    """pytest entry point; real assertions live in _check_llm_lingua_lite()."""
+    _check_llm_lingua_lite()
+
+
+def _check_mcp_tool_trimmer():
     """Test MCPToolTrimmer accuracy."""
     tools_json = """[
         {"name": "read_file", "description": "Read a file from disk", "parameters": {"properties": {"path": {"type": "string"}}, "required": ["path"]}},
@@ -257,7 +297,12 @@ def test_mcp_tool_trimmer():
     return "✓", metadata['savings_pct']
 
 
-def test_universal_optimizer():
+def test_mcp_tool_trimmer():
+    """pytest entry point; real assertions live in _check_mcp_tool_trimmer()."""
+    _check_mcp_tool_trimmer()
+
+
+def _check_universal_optimizer():
     """Test UniversalOptimizer routing accuracy."""
     # Test with code
     code = "def hello():\n    print('Hello world')\n\nhello()"
@@ -269,19 +314,24 @@ def test_universal_optimizer():
     return "✓", metadata.get('savings_pct', 0)
 
 
+def test_universal_optimizer():
+    """pytest entry point; real assertions live in _check_universal_optimizer()."""
+    _check_universal_optimizer()
+
+
 def run_all_tests():
     """Run all algorithm tests and report results."""
     tests = [
-        ("CodeContextTrimmer", test_code_context_trimmer),
-        ("ConversationCompressor", test_conversation_compressor),
-        ("JSONMinimizer", test_json_minimizer),
-        ("LogExtractor", test_log_extractor),
-        ("ImageDescriptionReducer", test_image_description_reducer),
-        ("ArchitectureContextPacker", test_architecture_context_packer),
-        ("SemanticChunker", test_semantic_chunker),
-        ("LLMLinguaLite", test_llm_lingua_lite),
-        ("MCPToolTrimmer", test_mcp_tool_trimmer),
-        ("UniversalOptimizer", test_universal_optimizer),
+        ("CodeContextTrimmer", _check_code_context_trimmer),
+        ("ConversationCompressor", _check_conversation_compressor),
+        ("JSONMinimizer", _check_json_minimizer),
+        ("LogExtractor", _check_log_extractor),
+        ("ImageDescriptionReducer", _check_image_description_reducer),
+        ("ArchitectureContextPacker", _check_architecture_context_packer),
+        ("SemanticChunker", _check_semantic_chunker),
+        ("LLMLinguaLite", _check_llm_lingua_lite),
+        ("MCPToolTrimmer", _check_mcp_tool_trimmer),
+        ("UniversalOptimizer", _check_universal_optimizer),
     ]
     
     print("=" * 70)

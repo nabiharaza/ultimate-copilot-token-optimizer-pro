@@ -394,12 +394,18 @@ class CompressionProxy:
         return [f for f in features if get_config(f"compression.{f}.enabled", "true") == "true"]
 
 
-def start_proxy(upstream: str = "anthropic", port: int = 8765) -> None:
-    """Start the compression proxy server."""
+def start_proxy(upstream: str = "anthropic", port: int = 8765, host: str = "127.0.0.1") -> None:
+    """Start the compression proxy server.
+
+    Binds to localhost by default since this proxy forwards Copilot/model
+    API traffic (including request/response bodies) and should not be
+    reachable from other machines on the network. Pass host="0.0.0.0"
+    explicitly if LAN access is genuinely needed.
+    """
     import uvicorn
-    
+
     console.print(f"[bold cyan]🔧 TrimP Compression Proxy[/bold cyan]")
-    console.print(f"   Listening: [bold]http://localhost:{port}[/bold]")
+    console.print(f"   Listening: [bold]http://{host}:{port}[/bold]")
     console.print(f"   Upstream: [bold]{UPSTREAMS.get(upstream, upstream)}[/bold]")
     console.print(f"   Session: {get_or_create_session()[:16]}...")
     console.print()
@@ -413,4 +419,4 @@ def start_proxy(upstream: str = "anthropic", port: int = 8765) -> None:
     console.print()
     
     proxy = CompressionProxy(upstream=upstream, port=port)
-    uvicorn.run(proxy.app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(proxy.app, host=host, port=port, log_level="warning")

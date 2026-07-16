@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TrimP — GitHub Copilot CLI hook bridge.
+"""TrimP — Copilot CLI / Claude Code hook bridge.
 
 Automatically intercepts bash and read tool calls to compress outputs BEFORE
 they enter the model context. No manual tool calls needed — compression is
@@ -10,6 +10,15 @@ Hook events:
   - postToolUse: Logs compression stats to database
   - sessionStart: Initializes session tracking
 
+Written originally for GitHub Copilot CLI's hook payload shape (camelCase
+keys like `sessionId`/`toolName`, output nested as `hookSpecificOutput` with
+lowerCamel event names). Claude Code uses snake_case input keys
+(`session_id`/`tool_name`/`tool_response`) and PascalCase event names
+(`PreToolUse`). Every payload read below checks both conventions, and event
+names echoed back in hook output are read from the incoming payload itself
+(falling back to the original Copilot literal) so this one script works
+under either host without caring which one is calling it.
+
 Exit behavior: Always exits 0 (never blocks tool calls).
 """
 
@@ -17,14 +26,16 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-# TrimP compression imports
-sys.path.insert(0, "/Users/nabiharaza/Projects/copilot-token-optimizer")
+# TrimP compression imports. Derived from this file's own location (not
+# hardcoded) so the hook works when installed/checked out anywhere, not just
+# on the machine it was originally written on.
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from TrimP.compression.advanced.universal_optimizer import UniversalOptimizer
@@ -36,7 +47,23 @@ except Exception:
 
 DB_PATH = Path.home() / ".trimp" / "TrimP.db"
 MAX_STDIN = 4 * 1024 * 1024  # 4MB max
-PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _secure_db_permissions() -> None:
+    """Best-effort: keep ~/.trimp and TrimP.db user-only (0700/0600).
+
+    This hook can be the first thing to create the DB (e.g. on a fresh
+    machine before `trimp init` ever runs), so it can't rely on the main
+    app having already locked permissions down. POSIX-only, silently a
+    no-op elsewhere.
+    """
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DB_PATH.parent.chmod(0o700)
+        if DB_PATH.exists():
+            DB_PATH.chmod(0o600)
+    except OSError:
+        pass
 WRAPPER_PATH = PROJECT_ROOT / "TrimP" / "copilot_bash_wrapper.py"
 DANGEROUS_SHELL_CHARS = re.compile(r"[;&|$(){}<>\n\r\x00]")
 SAFE_COMMAND_PREFIXES = {
@@ -68,6 +95,7 @@ _code = CodeContextTrimmer() if TRIMP_AVAILABLE else None
 def log_to_db(session_id: str, method: str, orig_chars: int, comp_chars: int, savings_pct: float):
     """Log compression event (compatible with dashboard schema)."""
     try:
+        _secure_db_permissions()
         conn = sqlite3.connect(str(DB_PATH))
         # Use dashboard's schema: tokens_before, tokens_after, compressor, compressed_at
         conn.execute("""
@@ -109,44 +137,6 @@ def read_stdin():
         return None
 
 
-def compress_bash_output(command: str) -> tuple[str, dict]:
-    """Compress bash command output using TrimP."""
-    if not TRIMP_AVAILABLE or not _bash:
-        return command, {"error": "TrimP unavailable", "savings_pct": 0}
-    
-    try:
-        # Execute command
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        raw_output = result.stdout
-        if result.stderr:
-            raw_output += f"\nSTDERR:\n{result.stderr}"
-        
-        if not raw_output or len(raw_output) < 500:
-            # Not worth compressing
-            return command, {"savings_pct": 0, "reason": "output_too_small"}
-        
-        # Compress the output
-        compressed, meta = _bash.compress(raw_output)
-        orig = len(raw_output)
-        comp = len(compressed)
-        savings = round((orig - comp) / orig * 100, 1) if orig > 0 else 0
-        
-        return command, {
-            "savings_pct": savings,
-            "original_chars": orig,
-            "compressed_chars": comp,
-            "method": meta.get("method", "BashCompressor"),
-        }
-    except Exception as e:
-        return command, {"error": str(e), "savings_pct": 0}
-
-
 def _decode_tool_args(payload: dict) -> dict:
     tool_args = payload.get("toolArgs", payload.get("tool_args", payload.get("tool_input", {})))
     if isinstance(tool_args, str):
@@ -156,6 +146,46 @@ def _decode_tool_args(payload: dict) -> dict:
         except Exception:
             return {}
     return tool_args if isinstance(tool_args, dict) else {}
+
+
+def _session_id(payload: dict) -> str:
+    """Copilot sends `sessionId`; Claude Code sends `session_id`."""
+    return str(payload.get("sessionId") or payload.get("session_id") or "unknown")
+
+
+def _event_name(payload: dict, fallback: str) -> str:
+    """Echo back whatever event-name casing the host itself used.
+
+    Copilot's hook JSON doesn't reliably include this field (hence the
+    literal fallback strings kept at each call site); Claude Code always
+    sends `hook_event_name` (PascalCase, e.g. "PreToolUse") and expects the
+    same string echoed back in `hookSpecificOutput.hookEventName`.
+    """
+    return payload.get("hook_event_name") or payload.get("hookEventName") or fallback
+
+
+def _extract_tool_output(payload: dict) -> str:
+    """Pull the tool's result text out of a PostToolUse payload.
+
+    Claude Code's field is `tool_response` (an object, typically with a
+    `stdout`/`stderr` shape for Bash-like tools). Copilot CLI's older field
+    was `result` with `output`/`content` sub-keys. Checked defensively since
+    getting this wrong means silently compressing nothing.
+    """
+    result = payload.get("tool_response", payload.get("result", ""))
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            return result
+    if isinstance(result, dict):
+        if "stdout" in result or "stderr" in result:
+            combined = str(result.get("stdout") or "")
+            if result.get("stderr"):
+                combined += f"\nSTDERR:\n{result['stderr']}"
+            return combined
+        return str(result.get("output", result.get("content", "")) or "")
+    return str(result) if result else ""
 
 
 def _can_rewrite_command(command: str) -> bool:
@@ -212,9 +242,9 @@ def handle_pre_tool_use():
 
     print(json.dumps({
         "hookSpecificOutput": {
-            "hookEventName": "preToolUse",
+            "hookEventName": _event_name(payload, "preToolUse"),
             "updatedInput": updated,
-            "modifiedArgs": updated,
+            "modifiedArgs": updated,  # legacy Copilot key; Claude Code ignores it
             "permissionDecision": "allow",
         }
     }))
@@ -227,28 +257,23 @@ def handle_post_tool_use():
         return
     
     tool_name = payload.get("toolName", payload.get("tool_name", ""))
-    session_id = payload.get("sessionId", "unknown")
-    
-    # Get tool output from result
-    result = payload.get("result", {})
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except Exception:
-            pass
-    
-    output = ""
-    if isinstance(result, dict):
-        output = result.get("output", result.get("content", ""))
-    elif isinstance(result, str):
-        output = result
-    
+    session_id = _session_id(payload)
+    output = _extract_tool_output(payload)
+
     if not output or len(output) < 500:
         return  # Not worth compressing
     
     # Compress based on tool type
     if tool_name.lower() == "bash":
-        compressed, meta = _bash.compress(output) if _bash else (output, {"savings_pct": 0})
+        if _bash:
+            # BashCompressor.compress() returns (text, tokens_saved_estimate:
+            # int) — not (text, metadata dict) like the other compressors.
+            # Using it as a dict below (meta.get(...)) would raise
+            # AttributeError, silently swallowed by main()'s catch-all.
+            compressed, tokens_saved_est = _bash.compress(output)
+            meta = {"method": "BashCompressor", "tokens_saved_est": tokens_saved_est}
+        else:
+            compressed, meta = output, {"savings_pct": 0}
     elif tool_name.lower() in ["read", "view"]:
         compressed, meta = _code.compress(output) if _code else (output, {"savings_pct": 0})
     else:
@@ -272,8 +297,8 @@ def handle_user_prompt_submit():
     if not payload:
         return
     
-    session_id = payload.get("sessionId", "unknown")
-    
+    session_id = _session_id(payload)
+
     # Extract user's message
     user_message = payload.get("prompt", payload.get("message", payload.get("userMessage", "")))
     
@@ -305,7 +330,7 @@ def handle_user_prompt_submit():
             # measurement of potential savings rather than guaranteed savings.
             response = {
                 "hookSpecificOutput": {
-                    "hookEventName": "userPromptSubmit",
+                    "hookEventName": _event_name(payload, "userPromptSubmit"),
                     "additionalContext": (
                         f"[TrimP measured this prompt at {orig // 4} -> {comp // 4} "
                         f"estimated tokens ({savings:.0f}% potential reduction).]"
@@ -323,10 +348,11 @@ def handle_session_start():
     if not payload:
         return
     
-    session_id = payload.get("sessionId", "unknown")
-    
+    session_id = _session_id(payload)
+
     # Ensure DB exists
     try:
+        _secure_db_permissions()
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (

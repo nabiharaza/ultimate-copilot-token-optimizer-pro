@@ -29,6 +29,12 @@ dependencies = [
     "psutil>=5.9",
 ]
 
+[project.optional-dependencies]
+# Needed only for TrimP_mcp_server.py (Claude Code / other MCP-client
+# integration). Kept optional so the core CLI/dashboard/proxy install
+# doesn't pull it in for people who never use MCP.
+mcp = ["fastmcp>=0.2"]
+
 [project.scripts]
 trimp = "TrimP.cli:app"
 TrimP = "TrimP.cli:app"

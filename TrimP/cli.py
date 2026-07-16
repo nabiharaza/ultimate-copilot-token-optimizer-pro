@@ -86,6 +86,23 @@ def report(
     rc.run(session_id=session)
 
 
+@app.command(name="ab-report")
+def ab_report_cmd(
+    before: str = typer.Option(None, "--before", help="Repository name/substring identifying the TrimPy-off run"),
+    after: str = typer.Option(None, "--after", help="Repository name/substring identifying the TrimPy-on run"),
+    limit: int = typer.Option(8, "--limit", "-n", help="Rows to show when listing recent real usage"),
+):
+    """[bold]⚖️  Real (not estimated) before/after token & cost comparison.[/bold]
+
+    Reads real VS Code Agent Debug Logs and Copilot CLI event snapshots —
+    the same vendor-written data the dashboard's Conversations page uses —
+    never TrimPy's own estimate. Run with no options to list recent real
+    usage; pass --before/--after to get a computed side-by-side diff.
+    """
+    from TrimP.commands import ab_report as ab
+    ab.run(before=before, after=after, limit=limit)
+
+
 @app.command(name="memory-review")
 def memory_review_cmd(
     path: str = typer.Option(None, "--path", "-p", help="Path to MEMORY.md"),
@@ -119,6 +136,7 @@ def resume_lean_cmd(
 def dashboard(
     mode: str = typer.Option("terminal", "--mode", "-m", help="terminal | web | both"),
     port: int = typer.Option(7432, "--port", "-p"),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Web dashboard bind address (default localhost-only)"),
     no_browser: bool = typer.Option(False, "--no-browser"),
     build: bool = typer.Option(False, "--build", help="Build React frontend"),
     session: str = typer.Option(None, "--session", "-s"),
@@ -133,11 +151,11 @@ def dashboard(
         launch(session_id=session)
     elif mode == "web":
         from TrimP.dashboard.server import launch as web_launch
-        web_launch(port=port, open_browser=not no_browser)
+        web_launch(port=port, open_browser=not no_browser, host=host)
     elif mode == "both":
         import threading
         from TrimP.dashboard.server import launch as web_launch
-        t = threading.Thread(target=web_launch, kwargs={"port": port, "open_browser": not no_browser}, daemon=True)
+        t = threading.Thread(target=web_launch, kwargs={"port": port, "open_browser": not no_browser, "host": host}, daemon=True)
         t.start()
         from TrimP.dashboard.terminal import launch
         launch(session_id=session)
@@ -467,21 +485,39 @@ def auto_status():
 
 @app.command("monitor")
 def monitor_cmd(
-    mode: str = typer.Option("events", help="What to monitor: events, logs")
+    mode: str = typer.Option("events", help="What to monitor: events, logs, editors, editor-status, editor-stop"),
+    daemon: bool = typer.Option(False, "--daemon", help="Run editor monitor in the background"),
+    interval: float = typer.Option(1.0, "--interval", help="Editor monitor refresh/import interval in seconds"),
 ):
     """[bold]🔍 Real-time monitoring.[/bold]
     
-    Watch compression events or auto-runner logs in real-time.
+    Watch compression events, logs, or editor capture health in real-time.
     """
-    from TrimP.monitor import monitor_realtime, monitor_logs
+    from TrimP.monitor import (
+        monitor_realtime,
+        monitor_logs,
+        monitor_editors,
+        start_editor_monitor,
+        stop_editor_monitor,
+        status_editor_monitor,
+    )
     
     if mode == "events":
         monitor_realtime()
     elif mode == "logs":
         monitor_logs()
+    elif mode == "editors":
+        if daemon:
+            start_editor_monitor(interval=interval)
+        else:
+            monitor_editors(interval=interval)
+    elif mode == "editor-status":
+        status_editor_monitor()
+    elif mode == "editor-stop":
+        stop_editor_monitor()
     else:
         console.print(f"❌ Unknown mode: {mode}")
-        console.print("   Use: events or logs")
+        console.print("   Use: events, logs, editors, editor-status, or editor-stop")
 
 
 # ──────────────────────── proxy (integration) ───────────────────────────
@@ -494,18 +530,19 @@ app.add_typer(proxy_app, name="proxy")
 def proxy_start(
     upstream: str = typer.Option("anthropic", "--upstream", "-u", help="anthropic | openai | azure | <custom-url>"),
     port: int = typer.Option(8765, "--port", "-p"),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Bind address (default localhost-only)"),
 ):
     """[bold]🔌 Start compression proxy server.[/bold]
-    
+
     Intercepts API calls, applies compression, forwards to upstream.
-    
+
     Usage:
         1. TrimP proxy start
         2. export ANTHROPIC_BASE_URL=http://localhost:8765
         3. Use Copilot CLI normally — compression happens automatically
     """
     from TrimP.proxy import start_proxy
-    start_proxy(upstream=upstream, port=port)
+    start_proxy(upstream=upstream, port=port, host=host)
 
 
 @proxy_app.command("test")
@@ -619,8 +656,9 @@ def intellij_proxy(
     console.print()
 
     os.environ["COPILOT_INTEGRATION_ID"] = integration_id
-    from TrimP.intellij_proxy import main as proxy_main
-    proxy_main(host=host, port=port)
+    from TrimP.intellij_proxy import start_proxy
+    result = start_proxy(host=host, port=port, background=True)
+    console.print_json(json.dumps(result))
 
 
 @intellij_app.command("config")
@@ -700,6 +738,16 @@ def intellij_test(
     except Exception as e:
         console.print(f"[red]✗ Proxy not reachable: {e}[/red]")
         console.print("Start with: [bold]TrimP intellij proxy[/bold]")
+
+
+@intellij_app.command("probe")
+def intellij_probe(
+    editor: str = typer.Option("pycharm", "--editor", "-e", help="pycharm | rider | vscode"),
+    port: int = typer.Option(8767, "--port", "-p"),
+):
+    """Verify editor traffic can be intercepted by the local HTTPS bridge."""
+    from TrimP.intellij_proxy import probe_proxy
+    console.print_json(json.dumps(probe_proxy(editor=editor, port=port)))
 
 
 # ──────────────────────── version ────────────────────────────────────────

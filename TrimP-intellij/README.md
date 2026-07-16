@@ -29,7 +29,7 @@ The proxy intercepts all Copilot Chat requests, compresses the context using Tri
 ### 1. Start the Proxy
 
 ```bash
-cd /Users/nabiharaza/Projects/copilot-token-optimizer
+cd /path/to/copilot-token-optimizer
 ./TrimP-intellij/TrimP-intellij-proxy --port 8765
 ```
 

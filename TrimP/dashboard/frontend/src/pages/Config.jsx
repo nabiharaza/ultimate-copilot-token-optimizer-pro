@@ -6,7 +6,7 @@ import {
   Server, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Tag, Terminal, Trash2,
   WalletCards, X, XCircle, Zap,
 } from 'lucide-react'
-import { useApi } from '../hooks/useApi.js'
+import { useApi, useRefreshTick } from '../hooks/useApi.js'
 import { Loading } from '../components/Charts.jsx'
 
 const FEATURE_META = {
@@ -41,7 +41,14 @@ function displayValue(value) {
   return value === undefined || value === null || value === '' ? '—' : String(value)
 }
 
-export default function Config() {
+function shortTime(value) {
+  if (!value) return 'No traffic yet'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+export default function Config({ onNavigate }) {
   const { data: config, loading, refetch } = useApi('/api/config')
   const [saving, setSaving] = useState(null)
   const [editValues, setEditValues] = useState({})
@@ -52,17 +59,14 @@ export default function Config() {
   const [saveMessage, setSaveMessage] = useState('')
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState(() => new Set())
+  const refreshTick = useRefreshTick()
 
   async function loadHealth() {
     const response = await fetch('/api/live-health')
     if (response.ok) setHealth(await response.json())
   }
 
-  useEffect(() => {
-    loadHealth()
-    const timer = setInterval(loadHealth, 5000)
-    return () => clearInterval(timer)
-  }, [])
+  useEffect(() => { loadHealth() }, [refreshTick])
 
   const compressionEntries = Object.keys(FEATURE_META).filter(key => key.startsWith('compression.'))
   const visibleCompression = useMemo(() => compressionEntries.filter(key => {
@@ -147,6 +151,7 @@ export default function Config() {
     { label: 'IDE bridge', detail: ide?.detail || 'Waiting for health check', status: ide?.status || 'down', icon: GitBranch },
     { label: 'IDE HTTPS bridge', detail: ide?.detail || 'Waiting for health check', status: ide?.status || 'down', icon: LockKeyhole },
   ]
+  const editorProbes = health?.editor_probes || []
 
   function toggleExpand(key) {
     setExpanded(current => {
@@ -181,6 +186,7 @@ export default function Config() {
           <div className="settings-section-heading"><div><h2><Activity size={16} /> Live service health</h2><p>Automatic checks for every TrimPy dependency and IDE bridge.</p></div><button className="icon-button" onClick={loadHealth} title="Refresh health"><RefreshCw size={16} /></button></div>
           <div className="settings-service-grid">{services.map(service => { const Icon = service.icon; const up = service.status === 'up'; return <div className={`settings-service-card ${up ? 'up' : 'down'}`} key={service.label}><div className="settings-service-name"><span>{up ? <CheckCircle2 size={15} /> : <XCircle size={15} />} </span><b>{service.label}</b></div><small>{service.detail}</small><em><i /> {up ? 'Working in real time' : 'Needs attention'}</em></div> })}</div>
           <div className="settings-ide-health">{(health?.configured_ides || []).map(ideItem => <span key={ideItem.product}><i />{ideItem.product} <b>•</b> {ideItem.host}:{ideItem.port}</span>)}{(!health || health.configured_ides?.length === 0) && <span>No IDE integrations configured</span>}</div>
+          <div className="settings-probe-grid">{editorProbes.map(probe => { const ok = !!probe.intercepted; const signal = probe.signal || {}; const last = signal.last_logged_at || signal.last_intercept_at || signal.last_probe_at; return <div className={`settings-probe-card ${ok ? 'up' : 'down'}`} key={probe.editor}><span>{ok ? <CheckCircle2 size={14} /> : <XCircle size={14} />}</span><b>{String(probe.editor || 'editor').toUpperCase()}</b><small>{probe.request_source || probe.error || 'No probe response'}</small><em>{ok ? 'Intercepting' : 'Not intercepted'} · {shortTime(last)}</em></div> })}</div>
         </article>
 
         <article className="settings-release-card settings-card">
@@ -214,7 +220,7 @@ export default function Config() {
       </section>
 
       <details className="settings-advanced-card settings-card"><summary><FileCode2 size={16} /><span><b>Advanced configuration</b><small>Proxy, quality, session database, and other low-level controls.</small></span><ChevronDown size={16} /></summary><div className="settings-advanced-grid">{ADVANCED_KEYS.map(key => <label key={key}><b>{key}</b><input value={staged(key)} onChange={event => update(key, event.target.value)} /></label>)}</div></details>
-      <footer className="settings-footer"><LockKeyhole size={16} /><span>All settings are stored securely on your machine and never leave your environment.</span><a href="#system" onClick={() => window.location.hash = '#system'}>View documentation <ExternalLink size={13} /></a></footer>
+      <footer className="settings-footer"><LockKeyhole size={16} /><span>All settings are stored securely on your machine and never leave your environment.</span><a href="#system" onClick={event => { event.preventDefault(); onNavigate?.('system') }}>View documentation <ExternalLink size={13} /></a></footer>
 
       {clearOpen && <div className="confirm-backdrop" role="dialog" aria-modal="true" aria-label="Clear database confirmation"><section className="confirm-dialog"><button className="confirm-close" onClick={() => setClearOpen(false)} title="Close"><X size={17} /></button><div className="confirm-icon"><Info size={22} /></div><h2>Clear DB?</h2><p>This permanently deletes all captured conversations, traces, quality scores, and savings data. This cannot be undone.</p><label>Type <strong>CLEAR DB</strong> to confirm</label><input autoFocus value={confirmation} onChange={event => setConfirmation(event.target.value)} placeholder="CLEAR DB" /><div className="confirm-actions"><button className="secondary-button" onClick={() => setClearOpen(false)}>Cancel</button><button className="danger-button" disabled={confirmation !== 'CLEAR DB' || clearState === 'clearing'} onClick={clearDatabase}>{clearState === 'clearing' ? 'Clearing…' : clearState === 'cleared' ? 'Cleared' : 'Clear DB'}</button></div></section></div>}
     </main>

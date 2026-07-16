@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { BookOpen, CheckCircle2, ChevronDown, Clock3, FileText, FlaskConical, Gauge, LockKeyhole, Power, RefreshCw, ShieldCheck, Sparkles, Wrench, Zap } from 'lucide-react'
 import TestGuide from '../components/TestGuide.jsx'
 import TrimPSwitch, { useTrimPEnabled } from '../components/TrimPSwitch.jsx'
+import ManagerProofCard from '../components/ManagerProofCard.jsx'
+import { useRefreshTick } from '../hooks/useApi.js'
 
 const DEMO_MESSAGE = `Review the current repository and explain how the request pipeline works. Keep the important constraints, identify the main files, summarize the repeated tool output below, and suggest the safest next steps.
 
@@ -27,7 +29,7 @@ function pct(value) { return `${Number(value || 0).toFixed(2)}%` }
 function localTime(value) { return value ? new Date(value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '—' }
 function cleanRepository(value) { const normalized = String(value || '').replace(/\\r?\\n/g, '\n'); return normalized.split(/\r?\n/)[0].trim() || 'unknown' }
 
-export default function LiveTest() {
+export default function LiveTest({ onNavigate }) {
   const [repositories, setRepositories] = useState([])
   const [repository, setRepository] = useState('unassigned')
   const [testCase, setTestCase] = useState(TEST_CASES[0].id)
@@ -39,6 +41,7 @@ export default function LiveTest() {
   const [statusMessage, setStatusMessage] = useState('Choose a repository and test case, then run the A/B test.')
   const [runHistory, setRunHistory] = useState(() => { try { return JSON.parse(localStorage.getItem('TrimP_test_runs') || '[]') } catch { return [] } })
   const { enabled, setEnabled, saving, error: optimizerError } = useTrimPEnabled()
+  const refreshTick = useRefreshTick()
 
   const selectedCase = useMemo(() => TEST_CASES.find(item => item.id === testCase) || TEST_CASES[0], [testCase])
 
@@ -47,9 +50,9 @@ export default function LiveTest() {
       const repoRows = Array.isArray(repositoryPayload) ? repositoryPayload : (repositoryPayload.repositories || [])
       const cleanedRows = repoRows.map(repo => ({ ...repo, repository: cleanRepository(repo.repository) }))
       setRepositories(cleanedRows)
-      if (cleanedRows?.[0]?.repository) setRepository(cleanedRows[0].repository)
+      setRepository(current => current !== 'unassigned' && cleanedRows.some(repo => repo.repository === current) ? current : cleanedRows?.[0]?.repository || 'unassigned')
     }).catch(() => setStatusMessage('Could not load repository metadata; the test can still run as unassigned.'))
-  }, [])
+  }, [refreshTick])
 
   function chooseCase(value) {
     setTestCase(value)
@@ -108,6 +111,7 @@ export default function LiveTest() {
     <header className="live-test-header"><div><div className="conversation-kicker"><FlaskConical size={15} /> A/B preflight</div><h1>Compare TrimPy on and off</h1><p>Offline request-body evidence for a quick demo. Use Validation for repeatable suites and Live IDE proof for actual proxy traffic.</p></div><div className="live-test-header-actions"><button className="test-button primary" onClick={runAB} disabled={!!running}><Sparkles size={15} /> {running ? 'Testing…' : 'One-click A/B test'}</button><TrimPSwitch enabled={enabled} onToggle={setOptimizer} saving={saving} /></div></header>
 
     <section className={`live-test-notice ${enabled ? '' : 'is-off'}`}><ShieldCheck size={18} /><div><b>{enabled ? 'Safe local test' : 'TrimPy off · pass-through mode'}</b><span>This test measures the request body only. It does not contact GitHub or consume Copilot quota.</span><small>{optimizerError || statusMessage}</small></div><LockKeyhole size={16} /></section>
+    <ManagerProofCard active="preflight" repository={repository} onNavigate={onNavigate} />
     <TestGuide mode="preflight" />
     <section className="test-selection-bar"><label><span><GitRepoIcon /> Repository</span><select value={repository} onChange={event => setRepository(event.target.value)}><option value="unassigned">Unassigned / local test</option>{repositories.map(repo => <option key={repo.repository} value={repo.repository}>{repo.repository}</option>)}</select></label><label><span><FlaskConical size={14} /> Test case</span><select value={testCase} onChange={event => chooseCase(event.target.value)}>{TEST_CASES.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><div className="test-case-description"><b>{selectedCase.label}</b><span>{selectedCase.description}</span></div></section>
 

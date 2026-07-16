@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { BarChart3, Check, ChevronDown, Info, Lightbulb, RotateCcw, Save, Scale, ShieldCheck, SlidersHorizontal, Sparkles, Zap } from 'lucide-react'
+import { useRefreshTick } from '../hooks/useApi.js'
 
 const ALGORITHMS = [
   ['semantic_dedup', 'Semantic deduplication', 'Collapse near-duplicate code blocks and content.', ShieldCheck, 'Removes repeated context while preserving one canonical block.'],
@@ -25,7 +26,7 @@ function defaultsFor(mode) {
   return Object.fromEntries(ALGORITHMS.map(([id]) => [id, enabled.includes(id)]))
 }
 
-export default function TrimPolicy() {
+export default function TrimPolicy({ onNavigate }) {
   const [repo, setRepo] = useState('all repositories')
   const [policy, setPolicy] = useState('balanced')
   const [enabled, setEnabled] = useState(defaultsFor('balanced'))
@@ -34,10 +35,16 @@ export default function TrimPolicy() {
   const [saved, setSaved] = useState(false)
   const [saving, setSaving] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const refreshTick = useRefreshTick()
 
   useEffect(() => {
-    fetch('/api/repositories').then(response => response.json()).then(data => setRepos(data.repositories || [])).catch(() => setRepos([]))
-  }, [])
+    fetch('/api/repositories').then(response => response.json()).then(data => {
+      const next = data.repositories || []
+      setRepos(next)
+      setRepo(current => current !== 'all repositories' && next.some(item => item.repository === current) ? current : 'all repositories')
+    }).catch(() => setRepos([]))
+  }, [refreshTick])
 
   function choosePolicy(value) {
     setPolicy(value)
@@ -88,8 +95,8 @@ export default function TrimPolicy() {
     </section>
     <div className="policy-recommendation"><Info size={15} /><span><b>{mode.label}</b> is selected for {repo}. Customize individual features below before saving.</span></div>
 
-    <section className="policy-content-grid"><section className="policy-features-card"><header><div><h2>Context trimming features</h2><p>Choose which signals TrimPy can shape in this policy.</p></div><span className="policy-enabled-count">{enabledCount}/{ALGORITHMS.length} enabled</span></header><div className="policy-feature-list">{ALGORITHMS.map(([id, label, help, Icon, detail]) => <div className={`policy-feature-row ${expanded === id ? 'expanded' : ''}`} key={id}><div className="policy-feature-main"><span className={`policy-feature-icon ${enabled[id] ? 'on' : ''}`}><Icon size={15} /></span><span><b>{label}</b><small>{help}</small></span></div><div className="policy-feature-actions"><button className={`policy-switch ${enabled[id] ? 'on' : ''}`} role="switch" aria-checked={enabled[id]} aria-label={`${enabled[id] ? 'Disable' : 'Enable'} ${label}`} onClick={() => setEnabled(value => ({ ...value, [id]: !value[id] }))}><i /></button><button className="policy-expand" onClick={() => setExpanded(expanded === id ? null : id)} aria-label={`Explain ${label}`}><ChevronDown size={15} /></button></div>{expanded === id && <div className="policy-feature-detail">{detail} <b>{enabled[id] ? 'Included in requests.' : 'Excluded from requests.'}</b></div>}</div>)}</div><button className="policy-advanced"><SlidersHorizontal size={14} /> Advanced settings <ChevronDown size={14} /></button></section>
-      <aside className="policy-impact-rail"><section><div className="policy-section-title"><BarChart3 size={15} /> Estimated impact</div><small>Estimated reduction</small><strong>{reduction}%</strong><span className="policy-good-badge">Good savings</span><div className="policy-progress"><i style={{ width: `${reduction}%` }} /></div><div className="policy-scale"><span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div></section><section><small>Risk level</small><strong className={policy === 'aggressive' ? 'risk-orange' : ''}>{mode.risk}</strong><p>Safe for coding tasks with traceable decisions.</p></section><section><b>What this policy optimizes</b><ul><li>Removes redundant and stale context</li><li>Preserves review-critical comments</li><li>Maintains code behavior and structure</li><li>Records every applied algorithm</li></ul></section><section className="policy-tip"><Lightbulb size={16} /><b>Tip</b><p>Run the TrimPy benchmark on a real workflow before making an aggressive policy repository-wide.</p><button onClick={() => window.location.hash = '#demo'}>Run benchmark <Zap size={13} /></button></section></aside>
+    <section className="policy-content-grid"><section className="policy-features-card"><header><div><h2>Context trimming features</h2><p>Choose which signals TrimPy can shape in this policy.</p></div><span className="policy-enabled-count">{enabledCount}/{ALGORITHMS.length} enabled</span></header><div className="policy-feature-list">{ALGORITHMS.map(([id, label, help, Icon, detail]) => <div className={`policy-feature-row ${expanded === id ? 'expanded' : ''}`} key={id}><div className="policy-feature-main"><span className={`policy-feature-icon ${enabled[id] ? 'on' : ''}`}><Icon size={15} /></span><span><b>{label}</b><small>{help}</small></span></div><div className="policy-feature-actions"><button className={`policy-switch ${enabled[id] ? 'on' : ''}`} role="switch" aria-checked={enabled[id]} aria-label={`${enabled[id] ? 'Disable' : 'Enable'} ${label}`} onClick={() => setEnabled(value => ({ ...value, [id]: !value[id] }))}><i /></button><button className="policy-expand" onClick={() => setExpanded(expanded === id ? null : id)} aria-label={`Explain ${label}`}><ChevronDown size={15} /></button></div>{expanded === id && <div className="policy-feature-detail">{detail} <b>{enabled[id] ? 'Included in requests.' : 'Excluded from requests.'}</b></div>}</div>)}</div><button className="policy-advanced" onClick={() => setAdvancedOpen(value => !value)} aria-expanded={advancedOpen}><SlidersHorizontal size={14} /> Advanced settings <ChevronDown size={14} /></button>{advancedOpen && <div className="policy-advanced-panel">Repository overrides and protected-field rules are applied by the local proxy. Use the conservative policy for sensitive repositories and review the diff before saving.</div>}</section>
+      <aside className="policy-impact-rail"><section><div className="policy-section-title"><BarChart3 size={15} /> Estimated impact</div><small>Estimated reduction</small><strong>{reduction}%</strong><span className="policy-good-badge">Good savings</span><div className="policy-progress"><i style={{ width: `${reduction}%` }} /></div><div className="policy-scale"><span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div></section><section><small>Risk level</small><strong className={policy === 'aggressive' ? 'risk-orange' : ''}>{mode.risk}</strong><p>Safe for coding tasks with traceable decisions.</p></section><section><b>What this policy optimizes</b><ul><li>Removes redundant and stale context</li><li>Preserves review-critical comments</li><li>Maintains code behavior and structure</li><li>Records every applied algorithm</li></ul></section><section className="policy-tip"><Lightbulb size={16} /><b>Tip</b><p>Run the TrimPy benchmark on a real workflow before making an aggressive policy repository-wide.</p><button onClick={() => onNavigate?.('demo')}>Run benchmark <Zap size={13} /></button></section></aside>
     </section>
     <section className="policy-footer-bar"><button className="policy-reset" onClick={reset}><RotateCcw size={14} /> Reset to defaults</button><button className="policy-save" onClick={save} disabled={saving}><Save size={15} /> {saving ? 'Saving…' : saved ? 'Saved' : 'Save changes'}</button></section>
   </main>

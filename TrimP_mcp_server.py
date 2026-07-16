@@ -13,7 +13,7 @@ Usage:
     "servers": {
       "TrimP": {
         "command": "python3",
-        "args": ["/Users/nabiharaza/Projects/copilot-token-optimizer/TrimP_mcp_server.py"]
+        "args": ["/path/to/copilot-token-optimizer/TrimP_mcp_server.py"]
       }
     }
   }
@@ -33,8 +33,9 @@ from pathlib import Path
 logging.basicConfig(level=logging.CRITICAL)
 os.environ["LOGURU_LEVEL"] = "CRITICAL"
 
-# Add TrimP to path
-sys.path.insert(0, "/Users/nabiharaza/Projects/copilot-token-optimizer")
+# Add TrimP to path (derived from this file's location, not hardcoded, so
+# the MCP server works from any checkout on any machine)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastmcp import FastMCP
 
@@ -61,6 +62,22 @@ except Exception as e:
 
 DB_PATH = Path.home() / ".trimp" / "TrimP.db"
 
+
+def _secure_db_permissions() -> None:
+    """Best-effort: keep ~/.trimp and TrimP.db user-only (0700/0600).
+
+    The MCP server can be the first process to create the DB on a fresh
+    machine, so it can't assume the CLI/dashboard already locked it down.
+    POSIX-only, silently a no-op elsewhere.
+    """
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DB_PATH.parent.chmod(0o700)
+        if DB_PATH.exists():
+            DB_PATH.chmod(0o600)
+    except OSError:
+        pass
+
 mcp = FastMCP(
     name="TrimP-token-optimizer",
     instructions=(
@@ -75,6 +92,7 @@ mcp = FastMCP(
 def _log_to_db(method: str, original_chars: int, compressed_chars: int, savings_pct: float):
     """Log compression event to TrimP SQLite database."""
     try:
+        _secure_db_permissions()
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS compressions (
@@ -112,9 +130,15 @@ def _compress(text: str, mode: str = "universal") -> tuple[str, dict]:
         elif mode == "json":
             result, meta = _json_min.compress(text)
         elif mode == "bash":
-            result, meta = _bash.compress(text)
+            # BashCompressor.compress() returns (text, tokens_saved_estimate:
+            # int), not (text, metadata dict) like the other compressors —
+            # normalize it so the shared savings/logging code below works.
+            result, tokens_saved_est = _bash.compress(text)
+            meta = {"method": "BashCompressor", "tokens_saved_est": tokens_saved_est}
         elif mode == "search":
-            result, meta = _search.compress(text)
+            # Same int-vs-dict mismatch as BashCompressor above.
+            result, tokens_saved_est = _search.compress(text)
+            meta = {"method": "SearchCompressor", "tokens_saved_est": tokens_saved_est}
         else:
             result, meta = _universal.compress(text)
 
@@ -308,14 +332,30 @@ def TrimP_grep(pattern: str, path: str = ".", file_glob: str = "") -> str:
     Returns:
         Compressed search results.
     """
-    cmd = f"rg --no-heading -n {repr(pattern)} {repr(path)}"
+    # Built as argument lists (no shell=True) so pattern/path/file_glob can
+    # never break out into shell metacharacters/command substitution. The
+    # previous version interpolated repr(pattern) into a shell string, which
+    # is NOT shell-escaping and allowed injection via inputs containing a
+    # single quote (Python's repr() then switches to double quotes, which
+    # the shell happily expands $(...) and `...` inside).
+    rg_cmd = ["rg", "--no-heading", "-n", pattern, path]
     if file_glob:
-        cmd += f" -g {repr(file_glob)}"
-    cmd += " 2>/dev/null || grep -rn {repr(pattern)} {repr(path)} 2>/dev/null"
+        rg_cmd += ["-g", file_glob]
+    grep_cmd = ["grep", "-rn", pattern, path]
 
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        raw = result.stdout or "(no matches)"
+        result = subprocess.run(rg_cmd, capture_output=True, text=True, timeout=30)
+        raw = result.stdout
+        if result.returncode != 0 and not raw:
+            result = subprocess.run(grep_cmd, capture_output=True, text=True, timeout=30)
+            raw = result.stdout
+        raw = raw or "(no matches)"
+    except FileNotFoundError:
+        try:
+            result = subprocess.run(grep_cmd, capture_output=True, text=True, timeout=30)
+            raw = result.stdout or "(no matches)"
+        except Exception as e:
+            return f"Search error: {e}"
     except Exception as e:
         return f"Search error: {e}"
 

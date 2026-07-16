@@ -12,6 +12,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
+from typing import Any
 
 import httpx
 import uvicorn
@@ -31,18 +32,74 @@ from TrimP.copilot_logs import (
 from TrimP.quality import score_session
 from TrimP.session import get_or_create_session, get_recent_sessions
 from TrimP.validation import builtin_scenarios, mode_settings, run_scenario
-from TrimP.model_utils import normalize_copilot_model
+from TrimP.model_utils import (
+    MODEL_PRICING_PER_1M,
+    actual_cost as _shared_actual_cost,
+    normalize_copilot_model,
+)
 
 app = FastAPI(title="TrimP Dashboard", version="1.0.0")
 
 test_optimizer = ChatPayloadOptimizer()
 
+# Restricted to known local dashboard origins (built dashboard on 7432, Vite
+# dev server on 5173). A wildcard "*" origin here would let any webpage the
+# user's browser has open issue authenticated-by-network-location requests
+# to endpoints like /api/database/clear or /api/config/{key} — this server
+# has no other auth, so CORS is the only gate.
+_DASHBOARD_ORIGINS = [
+    "http://localhost:7432",
+    "http://127.0.0.1:7432",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_DASHBOARD_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def _reject_cross_origin_writes(request, call_next):
+    """Defense-in-depth CSRF guard.
+
+    CORSMiddleware only stops browser JS from *reading* a cross-origin
+    response; a "simple" POST (e.g. Content-Type: text/plain) is still sent
+    by the browser and still executed server-side before CORS is enforced.
+    Since this server has no other authentication, state-changing requests
+    (POST/PUT/DELETE) must carry an Origin/Referer we recognize, so a page
+    on an unrelated site cannot silently trigger e.g. /api/database/clear.
+    """
+    if request.method in ("POST", "PUT", "DELETE"):
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin and not any(origin.rstrip("/").startswith(o) for o in _DASHBOARD_ORIGINS):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"ok": False, "error": "Cross-origin request rejected."}, status_code=403)
+    return await call_next(request)
+
+
+# Every POST/PUT body on this app is a small dict (a config value, a test
+# message, a confirmation string, a validation mode) — nothing here expects
+# an upload. FastAPI/Starlette have no default request-size cap, so without
+# this a large POST body would be fully buffered/parsed before any endpoint
+# validation runs. 1MB is generous headroom over anything real callers send.
+_MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024
+
+
+@app.middleware("http")
+async def _reject_oversized_bodies(request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_REQUEST_BODY_BYTES:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"ok": False, "error": "Request body too large."}, status_code=413)
+        except ValueError:
+            pass
+    return await call_next(request)
 
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
@@ -59,17 +116,6 @@ MODEL_INPUT_PRICES_PER_1M = {
     "gemini": 3.00,
     "default": 3.00,
 }
-
-MODEL_PRICING_PER_1M = {
-    "haiku": {"input": 0.80, "output": 4.00, "cached": 0.08},
-    "sonnet": {"input": 3.00, "output": 15.00, "cached": 0.30},
-    "opus": {"input": 15.00, "output": 75.00, "cached": 1.50},
-    "gpt-5-mini": {"input": 0.25, "output": 2.00, "cached": 0.025},
-    "gpt": {"input": 1.25, "output": 10.00, "cached": 0.125},
-    "gemini": {"input": 1.25, "output": 5.00, "cached": 0.125},
-    "default": {"input": 3.00, "output": 15.00, "cached": 0.30},
-}
-
 
 def _threshold_for_range(range_name: str) -> str:
     now = datetime.now(timezone.utc)
@@ -120,6 +166,18 @@ def _auto_granularity(range_name: str) -> str:
     }.get(range_name, "day")
 
 
+# Minimum lookback each bucket size needs to render a real multi-point trend
+# instead of collapsing to a single bucket (see copilot_timeseries below).
+_MIN_SPAN_FOR_GRANULARITY = {
+    "minute": timedelta(hours=2),
+    "hour": timedelta(days=2),
+    "day": timedelta(days=7),
+    "week": timedelta(weeks=8),
+    "month": timedelta(days=182),
+    "year": timedelta(days=365 * 3),
+}
+
+
 def _bucket_time(value: datetime, granularity: str) -> datetime:
     if granularity == "minute":
         return value.replace(second=0, microsecond=0)
@@ -163,11 +221,59 @@ def _dollars_saved(tokens_saved: int, model: str | None = None) -> float:
 
 def _actual_cost(input_tokens: int, output_tokens: int, cached_tokens: int, model: str | None) -> float:
     """Estimate API-equivalent cost from exact IDE usage, not GitHub billing."""
-    name = (model or "").lower()
-    pricing = next((value for key, value in MODEL_PRICING_PER_1M.items() if key != "default" and key in name), MODEL_PRICING_PER_1M["default"])
-    cached = min(max(int(cached_tokens or 0), 0), max(int(input_tokens or 0), 0))
-    uncached = max(int(input_tokens or 0) - cached, 0)
-    return round((uncached * pricing["input"] + cached * pricing["cached"] + int(output_tokens or 0) * pricing["output"]) / 1_000_000.0, 8)
+    return _shared_actual_cost(input_tokens, output_tokens, cached_tokens, model)
+
+
+def _actual_cost_from_agent_models(models: list[dict]) -> float:
+    total = 0.0
+    for model in models or []:
+        total += _actual_cost(
+            int(model.get("input_tokens") or 0),
+            int(model.get("output_tokens") or 0),
+            int(model.get("cached_input_tokens") or 0),
+            model.get("model"),
+        )
+    return round(total, 8)
+
+
+def _actual_usage_metrics(actual_usage: str | dict | None, model: str | None = None) -> dict[str, float | int | bool]:
+    """Extract upstream usage, including Copilot cache-read/write accounting."""
+    data = _safe_json(actual_usage) if not isinstance(actual_usage, dict) else actual_usage
+    usage = data.get("usage", data) if isinstance(data, dict) else {}
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    cached_tokens = int(
+        usage.get("cache_read_input_tokens")
+        or (usage.get("input_tokens_details") or {}).get("cached_tokens")
+        or usage.get("cached_tokens")
+        or 0
+    )
+    cache_write_tokens = int(usage.get("cache_creation_input_tokens") or usage.get("cache_write_tokens") or 0)
+    total_tokens = input_tokens + output_tokens + cached_tokens + cache_write_tokens
+    token_details = (data.get("copilot_usage") or {}).get("token_details") if isinstance(data, dict) else None
+    token_details = token_details if isinstance(token_details, list) else []
+    metered_cost = 0.0
+    for detail in token_details:
+        try:
+            metered_cost += (
+                int(detail.get("token_count") or 0)
+                * int(detail.get("cost_per_batch") or 0)
+                / max(int(detail.get("batch_size") or 1), 1)
+                / 100_000_000_000.0
+            )
+        except (TypeError, ValueError):
+            continue
+    if not metered_cost and total_tokens:
+        metered_cost = _actual_cost(input_tokens + cache_write_tokens, output_tokens, cached_tokens, model)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "total_tokens": total_tokens,
+        "cost": round(metered_cost, 8),
+        "cost_from_copilot_meter": bool(token_details),
+    }
 
 
 def _pricing_for(model: str | None) -> dict[str, float]:
@@ -528,7 +634,7 @@ async def live_health():
         except Exception as exc:
             services.append({"name": name, "status": "down", "detail": str(exc)[:120]})
     try:
-        from TrimP.intellij_proxy import proxy_status
+        from TrimP.intellij_proxy import probe_proxy, proxy_status
         ide_proxy = proxy_status()
         services.append({"name": "IDE HTTPS proxy", "status": "up" if ide_proxy.get("running") else "down", "detail": f"127.0.0.1:{ide_proxy.get('port', 8767)}"})
         configured = list(ide_proxy.get("configured_ides", []))
@@ -539,8 +645,22 @@ async def live_health():
                 "host": "127.0.0.1",
                 "port": int(ide_proxy.get("vscode_port") or ide_proxy.get("port") or 8767),
             })
+        seen_editors: set[str] = set()
+        editor_probes = []
+        signals = ide_proxy.get("editor_signals") if isinstance(ide_proxy.get("editor_signals"), dict) else {}
+        for item in configured:
+            product = str(item.get("product") or "editor")
+            editor = "vscode" if "code" in product.lower() else "rider" if "rider" in product.lower() else "pycharm"
+            if editor in seen_editors:
+                continue
+            seen_editors.add(editor)
+            probe = probe_proxy(editor=editor, port=int(item.get("port") or ide_proxy.get("port") or 8767))
+            source = str(probe.get("request_source") or f"{editor}-copilot-chat")
+            probe["signal"] = signals.get(source, {})
+            editor_probes.append(probe)
     except Exception as exc:
         configured = []
+        editor_probes = []
         services.append({"name": "IDE HTTPS proxy", "status": "degraded", "detail": str(exc)[:120]})
     with db() as conn:
         rows = conn.execute(
@@ -553,7 +673,7 @@ async def live_health():
         source = str(row["request_source"] or "unknown")
         label = "PyCharm" if "pycharm" in source else "Rider" if "rider" in source else "VS Code" if "vscode" in source else "Copilot CLI" if "cli" in source else source
         clients.append({"name": label, "requests": int(row["requests"] or 0), "tokens_saved": int(row["saved"] or 0), "active": int(row["requests"] or 0) > 0})
-    return {"status": "up" if all(s["status"] == "up" for s in services) else "degraded", "checked_at": datetime.now(timezone.utc).isoformat(), "services": services, "configured_ides": configured, "clients": clients}
+    return {"status": "up" if all(s["status"] == "up" for s in services) else "degraded", "checked_at": datetime.now(timezone.utc).isoformat(), "services": services, "configured_ides": configured, "editor_probes": editor_probes, "clients": clients}
 
 
 @app.post("/api/agent-logs/import")
@@ -584,7 +704,7 @@ async def agent_log_usage(range: str = "day"):
 
 
 @app.get("/api/copilot/debug-sessions")
-async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: str = "all", repository: str = ""):
+async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: str = "all", repository: str = "", details: bool = False, turn_limit: int = 8):
     """Return parent IDE sessions with exact per-model-turn debug records."""
     threshold = _threshold_for_range(range)
     client = str(client or "all").lower()
@@ -612,28 +732,53 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: st
                ORDER BY ended_at DESC LIMIT ?""",
             (*session_params, max(1, min(limit, 200))),
         ).fetchall()
+        # Fetch every session's turns in one query instead of one query per
+        # session. The Sessions page polls this endpoint, so the default
+        # response intentionally omits full JSON context/trace blobs.
+        parent_ids = [dict(r)["parent_session_id"] for r in session_rows]
+        turns_by_session: dict[str, list] = {}
+        if parent_ids:
+            placeholders = ",".join("?" for _ in parent_ids)
+            turn_columns = "*" if details else (
+                "source_key, source_path, parent_session_id, child_session_id, turn_index, "
+                "request_kind, occurred_at, model, debug_name, input_tokens, output_tokens, "
+                "cached_tokens, total_tokens, ttft_ms, max_output_tokens, copilot_usage_nano_aiu, "
+                "substr(COALESCE(user_message, ''), 1, 1200) AS user_message, cwd, repository, ide, status, imported_at"
+            )
+            all_turns = conn.execute(
+                f"""SELECT {turn_columns} FROM copilot_debug_turns
+                   WHERE parent_session_id IN ({placeholders})
+                   ORDER BY occurred_at ASC, source_key ASC""",
+                parent_ids,
+            ).fetchall()
+            max_turns = max(1, min(int(turn_limit or 8), 30))
+            for row in all_turns:
+                bucket = turns_by_session.setdefault(row["parent_session_id"], [])
+                if len(bucket) < max_turns:
+                    bucket.append(row)
+
         output = []
         for session_row in session_rows:
             session = _clean_repository_item(dict(session_row))
-            turns = conn.execute(
-                """SELECT * FROM copilot_debug_turns
-                   WHERE parent_session_id=? ORDER BY occurred_at ASC, source_key ASC""",
-                (session["parent_session_id"],),
-            ).fetchall()
+            turns = turns_by_session.get(session["parent_session_id"], [])
             turn_items = []
             primary_input = primary_output = primary_cached = primary_total = 0
             exact_cost = primary_cost = 0.0
             model_costs: dict[str, float] = {}
             for row in turns:
                 item = _clean_repository_item(dict(row))
-                try:
-                    item["context"] = json.loads(item.get("context_json") or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    item["context"] = {}
-                try:
-                    item["trace"] = json.loads(item.get("trace_json") or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    item["trace"] = {}
+                if details:
+                    try:
+                        item["context"] = json.loads(item.get("context_json") or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        item["context"] = {}
+                    try:
+                        item["trace"] = json.loads(item.get("trace_json") or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        item["trace"] = {}
+                else:
+                    item["context"] = {"summary": "Full context omitted from the live summary response.", "source_path": item.get("source_path")}
+                    item["trace"] = {"summary": "Open a detailed trace view to load raw debug payloads.", "source_key": item.get("source_key")}
                 item["exact_cost_estimate"] = _actual_cost(item["input_tokens"], item["output_tokens"], item["cached_tokens"], item["model"])
                 item["uncached_input_tokens"] = max(int(item["input_tokens"] or 0) - int(item["cached_tokens"] or 0), 0)
                 item["pricing_per_million"] = _pricing_for(item["model"])
@@ -741,14 +886,8 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: st
                 turn_cost = _actual_cost(input_tokens, output_tokens, cached_tokens, model)
                 exact_cost += turn_cost
                 model_costs[model] = round(model_costs.get(model, 0) + turn_cost, 8)
-                try:
-                    request_body = json.loads(row.get("request_body") or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    request_body = {}
-                try:
-                    optimized_body = json.loads(row.get("optimized_body") or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    optimized_body = {}
+                request_preview = str(row.get("request_body") or "")[:1200]
+                optimized_preview = str(row.get("optimized_body") or "")[:1200]
                 turns.append({
                     "source_key": f"proxy:{row.get('id')}", "source_path": "TrimPy HTTPS proxy",
                     "parent_session_id": session_id, "child_session_id": session_id, "turn_index": index,
@@ -761,7 +900,11 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: st
                     "repository": row.get("repository"), "ide": "VS Code" if "vscode" in str(row.get("request_source")).lower() else "Rider" if "rider" in str(row.get("request_source")).lower() else "PyCharm",
                     "status": "reported" if observed_exact else "estimated",
                     "usage_source": "proxy_response" if observed_exact else "trimp_request_estimate",
-                    "context": {"request_body": request_body, "optimized_body": optimized_body, "debug_log": row.get("debug_log_excerpt") or ""},
+                    "context": {
+                        "request_body_preview": request_preview,
+                        "optimized_body_preview": optimized_preview,
+                        "debug_log": (row.get("debug_log_excerpt") or "")[:1200],
+                    },
                     "trace": {"request_source": row.get("request_source"), "compression_method": row.get("compression_method"), "compression_grade": row.get("compression_grade")},
                     "exact_cost_estimate": turn_cost, "uncached_input_tokens": max(input_tokens - cached_tokens, 0),
                     "pricing_per_million": _pricing_for(model),
@@ -790,35 +933,43 @@ async def copilot_debug_sessions(range: str = "day", limit: int = 50, client: st
 
 
 @app.get("/api/copilot/summary")
-async def copilot_summary(range: str = "day"):
+async def copilot_summary(range: str = "day", repository: str = ""):
     """Token-optimizer metrics sourced from real Copilot proxy compression events."""
     threshold = _threshold_for_range(range)
     agent_usage = _agent_usage_summary(threshold)
+    metric_filters = ["c.source='byok'", "c.compressed_at >= ?"]
+    metric_params: list[str] = [threshold]
+    if repository:
+        metric_filters.append("COALESCE(s.repository, 'unknown') = ?")
+        metric_params.append(repository)
+    metric_where = " AND ".join(metric_filters)
     with db() as conn:
         row = conn.execute(
             """SELECT COUNT(*) AS requests,
-                      COUNT(DISTINCT session_id) AS conversations,
-                      COALESCE(SUM(tokens_before), 0) AS tokens_before,
-                      COALESCE(SUM(tokens_after), 0) AS tokens_after,
-                      COALESCE(SUM(tokens_before - tokens_after), 0) AS tokens_saved,
-                      AVG(CASE WHEN tokens_before > 0
-                          THEN 100.0 * (tokens_before - tokens_after) / tokens_before
+                      COUNT(DISTINCT c.session_id) AS conversations,
+                      COALESCE(SUM(c.tokens_before), 0) AS tokens_before,
+                      COALESCE(SUM(c.tokens_after), 0) AS tokens_after,
+                      COALESCE(SUM(c.tokens_before - c.tokens_after), 0) AS tokens_saved,
+                      AVG(CASE WHEN c.tokens_before > 0
+                          THEN 100.0 * (c.tokens_before - c.tokens_after) / c.tokens_before
                           ELSE 0 END) AS avg_request_savings_pct,
-                      MAX(compressed_at) AS last_seen
-               FROM compressions
-               WHERE source='byok' AND compressed_at >= ?""",
-            (threshold,),
+                      MAX(c.compressed_at) AS last_seen
+               FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE """ + metric_where,
+            metric_params,
         ).fetchone()
         model_rows = conn.execute(
             """SELECT COALESCE(model_used, 'unknown') AS model,
                       COUNT(*) AS requests,
-                      COALESCE(SUM(tokens_after), 0) AS tokens_after,
-                      COALESCE(SUM(tokens_before - tokens_after), 0) AS tokens_saved
-               FROM compressions
-               WHERE source='byok' AND compressed_at >= ?
+                      COALESCE(SUM(c.tokens_after), 0) AS tokens_after,
+                      COALESCE(SUM(c.tokens_before - c.tokens_after), 0) AS tokens_saved
+               FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE """ + metric_where + """
                GROUP BY COALESCE(model_used, 'unknown')
                ORDER BY tokens_saved DESC""",
-            (threshold,),
+            metric_params,
         ).fetchall()
         repo_rows = conn.execute(
             """SELECT COALESCE(s.repository, 'unknown') AS repository,
@@ -835,10 +986,11 @@ async def copilot_summary(range: str = "day"):
             (threshold,),
         ).fetchall()
         usage_rows = conn.execute(
-            """SELECT actual_usage FROM compressions
-               WHERE source='byok' AND compressed_at >= ?
-                 AND actual_usage IS NOT NULL AND actual_usage != ''""",
-            (threshold,),
+            """SELECT c.actual_usage, c.model_used FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE """ + metric_where + """
+                 AND c.actual_usage IS NOT NULL AND c.actual_usage != ''""",
+            metric_params,
         ).fetchall()
 
     tokens_before = int(row["tokens_before"] or 0)
@@ -846,15 +998,17 @@ async def copilot_summary(range: str = "day"):
     tokens_saved = int(row["tokens_saved"] or 0)
     model_mix = [dict(r) | {"dollars_saved": _dollars_saved(int(r["tokens_saved"] or 0), r["model"])} for r in model_rows]
     total_dollars = round(sum(m["dollars_saved"] for m in model_mix), 6)
-    actual_input = actual_output = actual_cached = actual_total = 0
+    actual_input = actual_output = actual_cached = actual_cache_write = actual_total = 0
+    proxy_actual_cost = 0.0
     for usage_row in usage_rows:
         try:
-            usage = json.loads(usage_row["actual_usage"] or "{}")
-            details = usage.get("usage", usage)
-            actual_input += int(details.get("input_tokens", 0) or 0)
-            actual_output += int(details.get("output_tokens", 0) or 0)
-            actual_cached += int((details.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0)
-            actual_total += int(details.get("total_tokens", 0) or 0)
+            metrics = _actual_usage_metrics(usage_row["actual_usage"], usage_row["model_used"])
+            actual_input += int(metrics["input_tokens"])
+            actual_output += int(metrics["output_tokens"])
+            actual_cached += int(metrics["cached_tokens"])
+            actual_cache_write += int(metrics["cache_write_tokens"])
+            actual_total += int(metrics["total_tokens"])
+            proxy_actual_cost += float(metrics["cost"])
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
     proxy_actual_input = actual_input
@@ -863,16 +1017,18 @@ async def copilot_summary(range: str = "day"):
     proxy_actual_total = actual_total
     # GitHub's local agent shutdown record is the authoritative fallback when
     # the upstream response did not expose a usage object to the proxy.
-    if not actual_input and agent_usage["input_tokens"]:
+    if not repository and not actual_input and agent_usage["input_tokens"]:
         actual_input = agent_usage["input_tokens"]
-    if not actual_output and agent_usage["output_tokens"]:
+    if not repository and not actual_output and agent_usage["output_tokens"]:
         actual_output = agent_usage["output_tokens"]
-    if not actual_cached and agent_usage["cached_input_tokens"]:
+    if not repository and not actual_cached and agent_usage["cached_input_tokens"]:
         actual_cached = agent_usage["cached_input_tokens"]
-    if not actual_total and agent_usage["total_tokens"]:
+    if not repository and not actual_total and agent_usage["total_tokens"]:
         actual_total = agent_usage["total_tokens"]
+    actual_cost = round(proxy_actual_cost, 8) if proxy_actual_input else (0.0 if repository else _actual_cost_from_agent_models(agent_usage["models"]))
     return {
         "range": range,
+        "repository": repository,
         "requests": int(row["requests"] or 0),
         "conversations": int(row["conversations"] or 0),
         "tokens_before": tokens_before,
@@ -884,11 +1040,15 @@ async def copilot_summary(range: str = "day"):
         "actual_input_tokens": actual_input,
         "actual_output_tokens": actual_output,
         "actual_cached_input_tokens": actual_cached,
+        "actual_cache_write_tokens": actual_cache_write,
         "actual_total_tokens": actual_total,
+        "actual_cost": actual_cost,
         "proxy_actual_input_tokens": proxy_actual_input,
         "proxy_actual_output_tokens": proxy_actual_output,
         "proxy_actual_cached_input_tokens": proxy_actual_cached,
+        "proxy_actual_cache_write_tokens": actual_cache_write if proxy_actual_input else 0,
         "proxy_actual_total_tokens": proxy_actual_total,
+        "proxy_actual_cost": round(proxy_actual_cost, 8),
         "agent_log_input_tokens": agent_usage["input_tokens"],
         "agent_log_output_tokens": agent_usage["output_tokens"],
         "agent_log_cached_input_tokens": agent_usage["cached_input_tokens"],
@@ -968,11 +1128,16 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
         item["assistant_preview"] = " ".join((item.get("assistant_response") or "").split())[:240]
         item["request_source"] = item.get("request_source") or "unknown"
         item["actual_usage"] = _safe_json(item.get("actual_usage"))
-        usage_details = item["actual_usage"].get("usage", item["actual_usage"]) if isinstance(item["actual_usage"], dict) else {}
-        item["actual_input_tokens"] = int(usage_details.get("input_tokens") or usage_details.get("prompt_tokens") or 0)
-        item["actual_output_tokens"] = int(usage_details.get("output_tokens") or usage_details.get("completion_tokens") or 0)
-        item["actual_cached_tokens"] = int((usage_details.get("input_tokens_details") or {}).get("cached_tokens") or usage_details.get("cached_tokens") or 0)
+        usage_metrics = _actual_usage_metrics(item["actual_usage"], model)
+        item["actual_input_tokens"] = int(usage_metrics["input_tokens"])
+        item["actual_output_tokens"] = int(usage_metrics["output_tokens"])
+        item["actual_cached_tokens"] = int(usage_metrics["cached_tokens"])
+        item["actual_cache_write_tokens"] = int(usage_metrics["cache_write_tokens"])
+        item["actual_total_tokens"] = int(usage_metrics["total_tokens"])
         item["usage_source"] = "proxy_response" if item["actual_input_tokens"] else "trimp_request_estimate"
+        item["actual_cost"] = float(usage_metrics["cost"]) if item["actual_total_tokens"] else None
+        item["actual_cost_source"] = "copilot_usage.token_details" if usage_metrics["cost_from_copilot_meter"] else "model_pricing_estimate"
+        item["estimated_request_cost"] = _actual_cost(int(item.get("tokens_after") or 0), 0, 0, model)
         raw_recommendations = item.get("recommendations")
         try:
             parsed_recommendations = json.loads(raw_recommendations or "[]")
@@ -988,8 +1153,152 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
         item["model_source"] = algorithm_details.get("model_source") or "proxy trace"
         item["model_normalized"] = algorithm_details.get("model_normalized") or normalize_copilot_model(item.get("model_used"), fallback="unknown")
         item["model_used"] = item["model_normalized"]
+        # These full fields (each up to ~1MB, see _json_dumps limit in
+        # byok_proxy.log_to_database) are only ever consumed via the
+        # *_preview fields above — the frontend never reads the raw names.
+        # This endpoint is polled every second by several dashboard pages,
+        # so shipping the untruncated blobs on top of the previews was
+        # multiplying response size for no reason. original_text/
+        # compressed_text are kept: DiffReview.jsx reads those in full.
+        for _raw_field in ("request_body", "optimized_body", "response_body", "debug_log_excerpt", "algorithm_details"):
+            item.pop(_raw_field, None)
         conversations.append(item)
     return conversations
+
+
+@app.get("/api/copilot/conversations-page")
+async def copilot_conversations_page(
+    range: str = "day",
+    limit: int = 20,
+    offset: int = 0,
+    q: str = "",
+    model: str = "all",
+    source: str = "all",
+    client: str = "all",
+    grade: str = "all",
+):
+    """Fast paginated conversation browser response.
+
+    This is the page-optimized companion to /api/copilot/conversations. It
+    filters and paginates in SQLite, trims large text columns before they leave
+    the database, and returns table metadata with the rows in one round trip.
+    """
+    threshold = _threshold_for_range(range)
+    limit = max(1, min(int(limit or 20), 100))
+    offset = max(0, int(offset or 0))
+    filters = ["c.source='byok'", "c.compressed_at >= ?"]
+    params: list[Any] = [threshold]
+    q = str(q or "").strip().lower()
+    if q:
+        filters.append(
+            """(lower(COALESCE(c.original_text, '')) LIKE ?
+                OR lower(COALESCE(s.repository, '')) LIKE ?
+                OR lower(COALESCE(s.label, '')) LIKE ?
+                OR lower(COALESCE(c.session_id, '')) LIKE ?
+                OR lower(COALESCE(c.model_used, '')) LIKE ?)"""
+        )
+        params.extend([f"%{q}%"] * 5)
+    if model not in {"", "all"}:
+        filters.append("lower(COALESCE(c.model_used, '')) LIKE ?")
+        params.append(f"%{str(model).lower()}%")
+    if source not in {"", "all"}:
+        filters.append("COALESCE(c.request_source, 'unknown') = ?")
+        params.append(source)
+    if client not in {"", "all"}:
+        filters.append("lower(COALESCE(c.request_source, '')) LIKE ?")
+        params.append(f"%{str(client).lower()}%")
+    if grade not in {"", "all"}:
+        filters.append("COALESCE(c.compression_grade, 'F') = ?")
+        params.append(grade)
+    where = " AND ".join(filters)
+    with db() as conn:
+        summary_row = conn.execute(
+            f"""SELECT COUNT(*) AS total,
+                      COALESCE(SUM(c.tokens_before), 0) AS tokens_before,
+                      COALESCE(SUM(c.tokens_before - c.tokens_after), 0) AS tokens_saved,
+                      COALESCE(AVG(100.0 * (c.tokens_before - c.tokens_after) / NULLIF(c.tokens_before, 0)), 0) AS reduction
+               FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE {where}""",
+            params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""SELECT c.id,
+                      c.session_id,
+                      c.turn_id,
+                      c.compressed_at,
+                      c.model_used,
+                      c.tokens_before,
+                      c.tokens_after,
+                      (c.tokens_before - c.tokens_after) AS tokens_saved,
+                      ROUND(100.0 * (c.tokens_before - c.tokens_after) / NULLIF(c.tokens_before, 0), 2) AS savings_pct,
+                      substr(COALESCE(c.original_text, ''), 1, 1000) AS original_text,
+                      substr(COALESCE(c.compressed_text, ''), 1, 1000) AS compressed_text,
+                      substr(COALESCE(c.algorithm_details, ''), 1, 4000) AS algorithm_details,
+                      c.request_source,
+                      substr(COALESCE(c.debug_log_excerpt, ''), -4000) AS debug_log_excerpt,
+                      c.actual_usage,
+                      c.compression_grade,
+                      s.label,
+                      s.cwd,
+                      s.repository,
+                      s.branch,
+                      s.status
+               FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE {where}
+               ORDER BY c.compressed_at DESC
+               LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        ).fetchall()
+        facet_rows = conn.execute(
+            """SELECT c.model_used, c.request_source
+               FROM compressions c
+               WHERE c.source='byok' AND c.compressed_at >= ?
+               ORDER BY c.compressed_at DESC
+               LIMIT 500""",
+            (threshold,),
+        ).fetchall()
+
+    output = []
+    for row in rows:
+        item = _clean_repository_item(dict(row))
+        saved = int(item.get("tokens_saved") or 0)
+        model_value = item.get("model_used")
+        item["dollars_saved"] = _dollars_saved(saved, model_value)
+        item["prompt_preview"] = " ".join((item.get("original_text") or "").split())[:240]
+        item["optimized_preview"] = " ".join((item.get("compressed_text") or "").split())[:240]
+        item["request_source"] = item.get("request_source") or "unknown"
+        usage_metrics = _actual_usage_metrics(_safe_json(item.get("actual_usage")), model_value)
+        item["actual_input_tokens"] = int(usage_metrics["input_tokens"])
+        item["actual_output_tokens"] = int(usage_metrics["output_tokens"])
+        item["actual_cached_tokens"] = int(usage_metrics["cached_tokens"])
+        item["usage_source"] = "proxy_response" if item["actual_input_tokens"] else "trimp_request_estimate"
+        item["debug_log_preview"] = item.get("debug_log_excerpt") or ""
+        algorithm_details = _safe_json(item.get("algorithm_details"))
+        item["model_requested"] = algorithm_details.get("model_raw") or item.get("model_used")
+        item["model_source"] = algorithm_details.get("model_source") or "proxy trace"
+        item["model_normalized"] = algorithm_details.get("model_normalized") or normalize_copilot_model(item.get("model_used"), fallback="unknown")
+        item["model_used"] = item["model_normalized"]
+        for _raw_field in ("original_text", "compressed_text", "debug_log_excerpt", "algorithm_details", "actual_usage"):
+            item.pop(_raw_field, None)
+        output.append(item)
+
+    summary = dict(summary_row or {})
+    tokens_saved = int(summary.get("tokens_saved") or 0)
+    facets_models = sorted({normalize_copilot_model(row["model_used"], fallback="unknown") for row in facet_rows if row["model_used"]})
+    facets_sources = sorted({row["request_source"] or "unknown" for row in facet_rows})
+    return {
+        "rows": output,
+        "total": int(summary.get("total") or 0),
+        "summary": {
+            "before": int(summary.get("tokens_before") or 0),
+            "saved": tokens_saved,
+            "reduction": round(float(summary.get("reduction") or 0), 2),
+            "dollars": _dollars_saved(tokens_saved, None),
+        },
+        "facets": {"models": facets_models, "sources": facets_sources},
+    }
 
 
 @app.get("/api/copilot/daily")
@@ -1026,8 +1335,18 @@ async def copilot_timeseries(range: str = "day", granularity: str = "auto", repo
     if selected_granularity == "auto":
         selected_granularity = _auto_granularity(range)
     threshold = _threshold_for_range(range)
+    # Picking a coarser bucket (e.g. "Week") than the selected range spans
+    # used to collapse the whole chart into a single point — a 7-day range
+    # bucketed by week, or a 30-day range bucketed by month, always produces
+    # exactly one bucket. Rather than hiding granularity choices per range,
+    # widen the query window here so every granularity guarantees enough
+    # history for a real multi-point trend, regardless of the active range.
+    min_span = _MIN_SPAN_FOR_GRANULARITY.get(selected_granularity)
+    if min_span and range != "all":
+        widened = (datetime.now(timezone.utc) - min_span).isoformat()
+        threshold = min(threshold, widened)
     with db() as conn:
-        query = """SELECT c.compressed_at, c.model_used, c.tokens_before, c.tokens_after,
+        query = """SELECT c.compressed_at, c.model_used, c.tokens_before, c.tokens_after, c.actual_usage,
                           COALESCE(s.repository, 'unknown') AS repository
                    FROM compressions c
                    LEFT JOIN sessions s ON s.id = c.session_id
@@ -1054,6 +1373,12 @@ async def copilot_timeseries(range: str = "day", granularity: str = "auto", repo
             "tokens_after": 0,
             "tokens_saved": 0,
             "dollars_saved": 0.0,
+            "actual_input_tokens": 0,
+            "actual_output_tokens": 0,
+            "actual_cached_tokens": 0,
+            "actual_cache_write_tokens": 0,
+            "actual_total_tokens": 0,
+            "actual_cost": 0.0,
         })
         before = int(row["tokens_before"] or 0)
         after = int(row["tokens_after"] or 0)
@@ -1063,11 +1388,20 @@ async def copilot_timeseries(range: str = "day", granularity: str = "auto", repo
         item["tokens_after"] += after
         item["tokens_saved"] += saved
         item["dollars_saved"] += _dollars_saved(saved, row["model_used"])
+        usage_metrics = _actual_usage_metrics(row["actual_usage"], row["model_used"])
+        if usage_metrics["total_tokens"]:
+            item["actual_input_tokens"] += int(usage_metrics["input_tokens"])
+            item["actual_output_tokens"] += int(usage_metrics["output_tokens"])
+            item["actual_cached_tokens"] += int(usage_metrics["cached_tokens"])
+            item["actual_cache_write_tokens"] += int(usage_metrics["cache_write_tokens"])
+            item["actual_total_tokens"] += int(usage_metrics["total_tokens"])
+            item["actual_cost"] += float(usage_metrics["cost"])
 
     output = []
     for item in sorted(buckets.values(), key=lambda value: value["bucket"]):
         item["savings_pct"] = round(item["tokens_saved"] / item["tokens_before"] * 100.0, 2) if item["tokens_before"] else 0
         item["dollars_saved"] = round(item["dollars_saved"], 6)
+        item["actual_cost"] = round(item["actual_cost"], 8)
         output.append(item)
     return {"range": range, "granularity": selected_granularity, "repository": repository, "points": output}
 
@@ -1434,7 +1768,7 @@ async def list_repositories(client: str = "all"):
     with db() as conn:
         rows = conn.execute(
             f"""
-            SELECT 
+            SELECT
                 COALESCE(s.repository, 'unknown') AS repository,
                 COUNT(DISTINCT s.branch) as branch_count,
                 COUNT(DISTINCT c.session_id) as conversation_count,
@@ -1454,11 +1788,40 @@ async def list_repositories(client: str = "all"):
             """,
             (client_pattern,) if client_pattern else (),
         ).fetchall()
-        
+
+        # Branches for ALL repositories in one query instead of one query per
+        # repository (this endpoint used to run N+1 queries — one extra
+        # branch-aggregate query per repo row — on every poll).
+        branch_filter = ""
+        branch_params: list[str] = []
+        if client_pattern:
+            branch_filter = " AND lower(COALESCE(c.request_source, '')) LIKE ?"
+            branch_params.append(client_pattern)
+        branch_rows = conn.execute(
+            f"""
+            SELECT COALESCE(s.repository, 'unknown') as repository,
+                   COALESCE(s.branch, 'unknown') as name,
+                   COUNT(*) as requests,
+                   COALESCE(SUM(c.tokens_before - c.tokens_after), 0) as tokens_saved
+            FROM compressions c
+            LEFT JOIN sessions s ON s.id = c.session_id
+            WHERE c.source='byok'{branch_filter}
+            GROUP BY COALESCE(s.repository, 'unknown'), COALESCE(s.branch, 'unknown')
+            ORDER BY tokens_saved DESC
+            """,
+            branch_params,
+        ).fetchall()
+
+    branches_by_repo: dict[str, list[dict]] = {}
+    for b in branch_rows:
+        b = dict(b)
+        repo_key = b.pop("repository")
+        branches_by_repo.setdefault(repo_key, []).append(b)
+
     repositories = []
     for row in rows:
         repo_dict = _clean_repository_item(dict(row))
-        
+
         score = repo_dict.get("avg_score") or 0
         if score >= 80: avg_grade = "A"
         elif score >= 60: avg_grade = "B"
@@ -1469,30 +1832,9 @@ async def list_repositories(client: str = "all"):
         repo_dict["dollars_saved"] = _dollars_saved(int(repo_dict.get("tokens_saved") or 0))
         repo_dict["models"] = [m for m in (repo_dict.get("models") or "").split(",") if m]
         repo_dict["total_tokens"] = (repo_dict.get("tokens_before") or 0)
-        
-        # Get branches for this repo
-        with db() as conn2:
-            branch_filter = ""
-            branch_params = [repo_dict['repository']]
-            if client_pattern:
-                branch_filter = " AND lower(COALESCE(c.request_source, '')) LIKE ?"
-                branch_params.append(client_pattern)
-            branches = conn2.execute(
-                f"""
-                SELECT COALESCE(s.branch, 'unknown') as name,
-                       COUNT(*) as requests,
-                       COALESCE(SUM(c.tokens_before - c.tokens_after), 0) as tokens_saved
-                FROM compressions c
-                LEFT JOIN sessions s ON s.id = c.session_id
-                WHERE c.source='byok' AND COALESCE(s.repository, 'unknown') = ?{branch_filter}
-                GROUP BY COALESCE(s.branch, 'unknown')
-                ORDER BY tokens_saved DESC
-                """,
-                branch_params
-            ).fetchall()
-        repo_dict['branches'] = [dict(b) for b in branches]
+        repo_dict["branches"] = branches_by_repo.get(repo_dict["repository"], [])
         repositories.append(repo_dict)
-    
+
     return {"repositories": repositories}
 
 
@@ -1594,6 +1936,133 @@ async def validation_live_proof(client: str = "vscode", repository: str = "", ho
         "latest_baseline": baseline if not paired else None, "latest_optimized": optimized if not paired else None,
         "recent_events": events[:12],
         "proof_note": "Paired live proxy events from the selected IDE. Baseline is a TrimPy-off/no-op request; optimized is a request where the proxy removed tokens." if paired else "Send the same meaningful prompt once with TrimPy off and once with TrimPy on. Both events will appear here.",
+    }
+
+
+@app.get("/api/validation/proof-report")
+async def validation_proof_report(client: str = "all", repository: str = "", range: str = "day"):
+    """Manager-ready proof scorecard combining validation, ROI, and live evidence."""
+    threshold = _threshold_for_range(range)
+    live_threshold = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    repo_filter = "" if not repository or repository == "unassigned" else repository
+    client_filter = "" if str(client or "all").lower() in {"", "all"} else str(client).lower()
+    with db() as conn:
+        latest_run = conn.execute(
+            """SELECT * FROM validation_runs
+               WHERE summary_json IS NOT NULL AND summary_json != ''
+               ORDER BY created_at DESC LIMIT 1"""
+        ).fetchone()
+        filters = ["c.source='byok'", "c.compressed_at >= ?"]
+        params: list[Any] = [threshold]
+        if repo_filter:
+            filters.append("COALESCE(s.repository, '') = ?")
+            params.append(repo_filter)
+        if client_filter:
+            filters.append("lower(COALESCE(c.request_source, '')) LIKE ?")
+            params.append(f"%{client_filter}%")
+        where = " AND ".join(filters)
+        traffic = conn.execute(
+            f"""SELECT COUNT(*) AS requests,
+                      COUNT(DISTINCT c.session_id) AS conversations,
+                      COALESCE(SUM(c.tokens_before), 0) AS tokens_before,
+                      COALESCE(SUM(c.tokens_after), 0) AS tokens_after,
+                      COALESCE(SUM(c.tokens_before - c.tokens_after), 0) AS tokens_saved,
+                      COALESCE(AVG(100.0 * (c.tokens_before - c.tokens_after) / NULLIF(c.tokens_before, 0)), 0) AS avg_reduction,
+                      MAX(c.compressed_at) AS latest_at
+               FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE {where}""",
+            params,
+        ).fetchone()
+        live_count = conn.execute(
+            f"""SELECT COUNT(*) FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE {where} AND c.compressed_at >= ?""",
+            (*params, live_threshold),
+        ).fetchone()[0]
+        paired_prompts = conn.execute(
+            f"""SELECT substr(COALESCE(c.original_text, ''), 1, 500) AS prompt_key,
+                      SUM(CASE WHEN c.tokens_before > c.tokens_after THEN 1 ELSE 0 END) AS optimized_count,
+                      SUM(CASE WHEN c.tokens_before <= c.tokens_after THEN 1 ELSE 0 END) AS baseline_count
+               FROM compressions c
+               LEFT JOIN sessions s ON s.id = c.session_id
+               WHERE {where} AND COALESCE(c.original_text, '') != ''
+               GROUP BY prompt_key
+               HAVING optimized_count > 0 AND baseline_count > 0
+               LIMIT 20""",
+            params,
+        ).fetchall()
+
+    validation_summary = _safe_json(latest_run["summary_json"]) if latest_run else {}
+    traffic = dict(traffic or {})
+    requests = int(traffic.get("requests") or 0)
+    before = int(traffic.get("tokens_before") or 0)
+    saved = int(traffic.get("tokens_saved") or 0)
+    savings_pct = round(saved / before * 100, 2) if before else 0.0
+    validation_pass = validation_summary.get("verdict") == "PASS"
+    context_retention = float(validation_summary.get("context_retention_pct") or 0)
+    audit = float(validation_summary.get("audit_completeness_pct") or 0)
+    validation_pass_rate = (
+        float(validation_summary.get("passed_count") or 0) / float(validation_summary.get("execution_count") or 1) * 100
+        if validation_summary else 0
+    )
+    safety_score = round((validation_pass_rate * .35) + (context_retention * .35) + (audit * .3), 1) if validation_summary else 0
+    value_score = round(min(100, savings_pct * 1.7 + min(requests, 50)), 1)
+    live_score = round(min(100, (int(live_count or 0) * 20) + (len(paired_prompts) * 25)), 1)
+    trust_score = round((safety_score * .7) + (live_score * .3), 1)
+    if value_score >= 60 and trust_score >= 80:
+        quadrant = "High value / high trust"
+        decision = "Demo-ready production candidate"
+    elif value_score >= 60:
+        quadrant = "High value / lower trust"
+        decision = "Keep proving context safety before rollout"
+    elif trust_score >= 80:
+        quadrant = "High trust / lower value"
+        decision = "Safe, but tune policy or target larger contexts"
+    else:
+        quadrant = "Low value / low trust"
+        decision = "Do not position as ready yet"
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scope": {"client": client, "repository": repository or "all", "range": range},
+        "validation": {
+            "run_id": latest_run["id"] if latest_run else "",
+            "status": latest_run["status"] if latest_run else "missing",
+            "verdict": validation_summary.get("verdict") or "Not run",
+            "context_retention_pct": context_retention,
+            "audit_completeness_pct": audit,
+            "execution_count": int(validation_summary.get("execution_count") or 0),
+            "failed_count": int(validation_summary.get("failed_count") or 0),
+            "score": safety_score,
+        },
+        "value": {
+            "requests": requests,
+            "conversations": int(traffic.get("conversations") or 0),
+            "tokens_before": before,
+            "tokens_after": int(traffic.get("tokens_after") or 0),
+            "tokens_saved": saved,
+            "savings_pct": savings_pct,
+            "avg_request_reduction_pct": round(float(traffic.get("avg_reduction") or 0), 2),
+            "estimated_cost_saved": _dollars_saved(saved, None),
+            "score": value_score,
+        },
+        "live": {
+            "events_last_10m": int(live_count or 0),
+            "latest_at": traffic.get("latest_at"),
+            "paired_prompt_count": len(paired_prompts),
+            "score": live_score,
+        },
+        "matrix": {
+            "trust_score": trust_score,
+            "value_score": value_score,
+            "quadrant": quadrant,
+            "decision": decision,
+        },
+        "next_steps": [
+            "Run Validation Quick Check if no passing safety gate exists.",
+            "Run A/B Preflight on a long-context case to show local ROI.",
+            "Send the same real IDE prompt once with TrimPy off and once with TrimPy on for live paired evidence.",
+        ],
     }
 
 
@@ -1875,7 +2344,14 @@ def _placeholder_html() -> str:
 </html>"""
 
 
-def launch(port: int = 7432, open_browser: bool = True, reload: bool = False) -> None:
+def launch(port: int = 7432, open_browser: bool = True, reload: bool = False, host: str = "127.0.0.1") -> None:
+    """Start the web dashboard.
+
+    Binds to localhost by default: the dashboard surfaces full prompts,
+    code context, and diff evidence, so it should not be reachable from
+    other machines on the network. Pass host="0.0.0.0" explicitly if LAN
+    access is genuinely needed.
+    """
     if open_browser:
         import threading
         def _open():
@@ -1885,7 +2361,7 @@ def launch(port: int = 7432, open_browser: bool = True, reload: bool = False) ->
 
     uvicorn.run(
         "TrimP.dashboard.server:app",
-        host="0.0.0.0",
+        host=host,
         port=port,
         reload=reload,
         log_level="warning",

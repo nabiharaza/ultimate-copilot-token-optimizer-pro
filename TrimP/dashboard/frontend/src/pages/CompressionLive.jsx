@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Activity, TrendingUp, Zap, Database, Clock, RefreshCw } from 'lucide-react'
+import { useRefreshTick } from '../hooks/useApi.js'
 
 const COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#06b6d4']
 
@@ -51,14 +52,20 @@ export default function CompressionLive() {
   const [wsStatus,     setWsStatus]     = useState('connecting')
   const wsRef    = useRef(null)
   const pauseRef = useRef(false)
+  const mountedRef = useRef(true)
+  const refreshTick = useRefreshTick()
 
   // Keep pauseRef in sync so the ws callback sees the latest value
   useEffect(() => { pauseRef.current = paused }, [paused])
 
   // WebSocket for instant push — reconnects on disconnect
   useEffect(() => {
+    mountedRef.current = true
     connectWs()
-    return () => wsRef.current?.close()
+    return () => {
+      mountedRef.current = false
+      wsRef.current?.close()
+    }
   }, [])
 
   function connectWs() {
@@ -66,7 +73,10 @@ export default function CompressionLive() {
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/live`)
       ws.onopen    = () => setWsStatus('connected')
-      ws.onclose   = () => { setWsStatus('disconnected'); setTimeout(connectWs, 3000) }
+      ws.onclose   = () => {
+        setWsStatus('disconnected')
+        if (mountedRef.current) setTimeout(connectWs, 3000)
+      }
       ws.onerror   = () => setWsStatus('error')
       ws.onmessage = (e) => {
         try {
@@ -114,12 +124,9 @@ export default function CompressionLive() {
     }
   }
 
-  // 2-second polling fallback (WS is the primary push)
-  useEffect(() => {
-    fetchData()
-    const id = setInterval(fetchData, 2000)
-    return () => clearInterval(id)
-  }, [liveLimit])
+  // The shared one-second refresh signal is the polling fallback; WebSocket
+  // pushes still refresh immediately when the server emits an event.
+  useEffect(() => { fetchData() }, [liveLimit, refreshTick])
 
   const totalSaved  = recentComps.reduce((s, c) => s + (c.tokens_saved ?? 0), 0)
   const totalBefore = recentComps.reduce((s, c) => s + (c.tokens_before ?? 0), 0)
@@ -136,7 +143,7 @@ export default function CompressionLive() {
             Live Compression Monitor
           </h1>
           <p style={{ margin: '0.35rem 0 0', opacity: 0.6, fontSize: '0.875rem' }}>
-            Tracks every compression across all PyCharm / Copilot chat sessions • Refreshes every 2s
+            Tracks every compression across configured IDE and Copilot chat sessions • Refreshes every second
           </p>
         </div>
 
@@ -168,6 +175,7 @@ export default function CompressionLive() {
 
           <button
             onClick={() => setPaused(p => !p)}
+            aria-label={paused ? 'Resume live activity' : 'Pause live activity'}
             style={{
               padding: '0.35rem 0.9rem', borderRadius: '6px', border: 'none',
               cursor: 'pointer', fontWeight: 700, fontSize: '0.83rem',
@@ -180,6 +188,7 @@ export default function CompressionLive() {
           <button
             onClick={fetchData}
             title="Refresh now"
+            aria-label="Refresh live activity"
             style={{
               padding: '0.35rem 0.6rem', borderRadius: '6px',
               border: '1px solid var(--border)', cursor: 'pointer',

@@ -4,7 +4,10 @@ Test script for IntelliJ proxy - verifies compression works with various content
 """
 import json
 import sys
-sys.path.insert(0, "/Users/nabiharaza/Projects/copilot-token-optimizer")
+from pathlib import Path
+
+# Repo root is one level up from this file (TrimP-intellij/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from TrimP.chat_optimizer import ChatPayloadOptimizer
 from TrimP.compression.prompt_compression import PromptCompressor

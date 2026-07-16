@@ -28,6 +28,7 @@ from TrimP.copilot_auth import (
 )
 from TrimP.db import DB_PATH as SHARED_DB_PATH, get_connection
 from TrimP.model_utils import MODEL_ALIASES, normalize_copilot_model
+from TrimP.secret_redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,7 @@ def log_to_database(
     record_source: str = "byok",
 ):
     """Log compression stats to the database."""
+    conn = None
     try:
         get_connection()
         conn = sqlite3.connect(DB_PATH)
@@ -284,6 +286,18 @@ def log_to_database(
             "repository": str(context.get("repository") or _detect_repo(cwd)),
             "branch": str(context.get("branch") or _detect_branch(cwd)),
         }
+        # Scrub likely secrets (API keys, tokens, passwords) before anything
+        # else touches this data. Bodies/prompts/logs can contain whatever
+        # the user pasted into chat or a tool ran, and this DB has no
+        # encryption at rest, so this is the only line of defense against a
+        # leaked secret sitting in plaintext in ~/.trimp/TrimP.db.
+        user_prompt = redact_secrets(user_prompt) if user_prompt else user_prompt
+        optimized_prompt = redact_secrets(optimized_prompt) if optimized_prompt else optimized_prompt
+        assistant_response = redact_secrets(assistant_response) if assistant_response else assistant_response
+        request_body = redact_secrets(request_body) if request_body else request_body
+        optimized_body = redact_secrets(optimized_body) if optimized_body else optimized_body
+        response_body = redact_secrets(response_body) if response_body else response_body
+
         now = _now_iso()
         saved = original_tokens - compressed_tokens
         label = _conversation_label(user_prompt or "")
@@ -294,7 +308,8 @@ def log_to_database(
         changes = details.get("changes") if isinstance(details.get("changes"), list) else []
         score, grade, tips = _score_compression(original_tokens, compressed_tokens, changes)
         debug_excerpt = debug_log_excerpt if debug_log_excerpt is not None else _collect_debug_log_excerpt()
-        
+        debug_excerpt = redact_secrets(debug_excerpt) if debug_excerpt else debug_excerpt
+
         # Check if session exists
         cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
         if not cursor.fetchone():
@@ -396,9 +411,11 @@ def log_to_database(
         ))
         
         conn.commit()
-        conn.close()
     except Exception as e:
         logger.error(f"Failed to log to database: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @router.post("/TrimP/trace")
@@ -690,15 +707,17 @@ async def measure(request: Request):
 async def stats():
     """Aggregate BYOK compression events."""
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("""
-        SELECT COUNT(*) AS requests,
-               COALESCE(SUM(tokens_before), 0) AS before,
-               COALESCE(SUM(tokens_after), 0) AS after
-        FROM compressions
-        WHERE source='byok'
-    """).fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            SELECT COUNT(*) AS requests,
+                   COALESCE(SUM(tokens_before), 0) AS before,
+                   COALESCE(SUM(tokens_after), 0) AS after
+            FROM compressions
+            WHERE source='byok'
+        """).fetchone()
+    finally:
+        conn.close()
     before = int(row["before"] if row else 0)
     after = int(row["after"] if row else 0)
     saved = max(0, before - after)

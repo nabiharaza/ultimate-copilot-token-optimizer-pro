@@ -1,4 +1,4 @@
-import { Activity, Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Moon, Settings, ShieldCheck, SlidersHorizontal, Sun } from 'lucide-react'
+import { Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Moon, Settings, ShieldCheck, SlidersHorizontal, Sun } from 'lucide-react'
 import { useState } from 'react'
 
 const SIDEBAR_ITEMS = [
@@ -10,7 +10,6 @@ const SIDEBAR_ITEMS = [
   { id: 'system', icon: FileText, label: 'Connections' },
   { section: 'Insights' },
   { id: 'sessions', icon: MessageSquare, label: 'Conversations' },
-  { id: 'live', icon: Activity, label: 'Live activity' },
   { id: 'demo', icon: FlaskConical, label: 'A/B preflight' },
   { id: 'validation', icon: ShieldCheck, label: 'Validation' },
   { section: 'Admin' },
@@ -20,7 +19,7 @@ const SIDEBAR_ITEMS = [
   { id: 'settings', icon: Settings, label: 'Settings' },
 ]
 
-export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkMode, onToggleDarkMode }) {
+export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkMode, onToggleDarkMode, optimizerEnabled = true }) {
   const [brandClicks, setBrandClicks] = useState(0)
   const [secretOpen, setSecretOpen] = useState(false)
 
@@ -36,11 +35,11 @@ export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkM
   }
 
   return (
-    <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`} aria-label="Primary navigation">
+    <aside className={`sidebar ${collapsed ? 'collapsed' : ''} ${optimizerEnabled ? 'optimizer-on' : 'optimizer-off'}`} aria-label="Primary navigation">
       <div className="sidebar-top-row">
         <button className="brand-mini" aria-label="TrimPy home" title="TrimPy home" onClick={activateBrand}>
-          <span className="brand-mini-mark"><span className="brand-mini-top" /><span className="brand-mini-stem" /></span>
-          <span className="brand-mini-wordmark"><span className="brand-mini-name">TrimPy</span><span className="brand-mini-tagline">Cut tokens. Keep context.</span></span>
+          <span className="brand-mini-mark"><span className="brand-mini-letter">T</span><span className="brand-reduction-glyph" aria-hidden="true"><i /><i /><i /><b /></span><span className="brand-status-dot" aria-hidden="true" /></span>
+          <span className="brand-mini-wordmark"><span className="brand-mini-name">TrimPy</span><span className="brand-mini-tagline">token reducer</span></span>
         </button>
         <button className="sidebar-collapse" onClick={onToggle} aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'} title={collapsed ? 'Expand navigation' : 'Collapse navigation'}>
           {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
@@ -58,10 +57,6 @@ export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkM
       {secretOpen && <div className="sidebar-secret" role="status"><b>TrimPy unlocked</b><span>Cut the noise. Keep the signal.</span></div>}
       <div className="sidebar-footer">
         <button className="theme-toggle" onClick={onToggleDarkMode} aria-label={darkMode ? 'Use light mode' : 'Use dark mode'} title={darkMode ? 'Use light mode' : 'Use dark mode'}><span className="theme-toggle-icon">{darkMode ? <Sun size={17} /> : <Moon size={17} />}</span><span>{darkMode ? 'Light mode' : 'Dark mode'}</span></button>
-        <div className="avatar" aria-label="Trim-Pilot operator">
-          TP
-          <span className="avatar-dot" />
-        </div>
       </div>
     </aside>
   )

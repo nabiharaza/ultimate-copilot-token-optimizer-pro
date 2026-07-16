@@ -90,3 +90,93 @@ def test_global_trim_switch_forwards_original_body_when_disabled():
         assert stats.tokens_before == stats.tokens_after
     finally:
         set_config("compression.enabled", "true")
+
+
+def test_chat_history_sequence_compacts_old_context_and_keeps_recent_tail():
+    messages = []
+    for index in range(12):
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Historical request {index}: inspect services/payment_api.py and keep "
+                    "the database constraint names, endpoint paths, retry behavior, and "
+                    "deployment notes in mind. This context has repeated setup details. "
+                )
+                * 5,
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"Historical answer {index}: confirmed the files, noted the migration "
+                    "plan, listed noisy logs, and repeated the same operational summary. "
+                )
+                * 5,
+            }
+        )
+    messages.append({"role": "user", "content": "Latest question: what exact fix should I apply now?"})
+    body = {"messages": messages}
+
+    optimized, stats = ChatPayloadOptimizer(min_savings_pct=1).optimize_body(body, enabled=True)
+
+    assert stats.tokens_saved > 0
+    assert any(change.path == "messages" for change in stats.changes)
+    assert optimized["messages"][-1] == messages[-1]
+    assert len(optimized["messages"]) < len(messages)
+
+
+def test_chat_history_sequence_skips_tool_call_chains():
+    body = {
+        "messages": [
+            {"role": "user", "content": "Read the file."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": _large_tool_output()},
+        ]
+    }
+
+    optimized, stats = ChatPayloadOptimizer(min_savings_pct=1).optimize_body(body, enabled=True)
+
+    assert optimized["messages"][1] == body["messages"][1]
+    assert all(change.path != "messages" for change in stats.changes)
+
+
+def test_chat_history_aliases_repeated_anchors_without_touching_latest_turn():
+    repeated_path = "services/payment_api/retry_policy.py"
+    repeated_id = "PAYMENT-1042"
+    messages = []
+    for index in range(10):
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Earlier turn {index}: inspect {repeated_path} for {repeated_id}. "
+                    f"The file {repeated_path} controls {repeated_id} fallback behavior. "
+                )
+                * 4,
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"I checked {repeated_path}; {repeated_id} is still relevant. "
+                    "Keep the exact path and ticket available for later reasoning. "
+                )
+                * 4,
+            }
+        )
+    latest = {"role": "user", "content": f"Latest question: cite {repeated_path} directly."}
+    body = {"messages": [*messages, latest]}
+
+    optimized, stats = ChatPayloadOptimizer(min_savings_pct=1).optimize_body(body, enabled=True)
+
+    assert optimized["messages"][-1] == latest
+    assert any(change.path == "messages.aliases" for change in stats.changes)
+    assert "TrimPy context aliases" in optimized["messages"][0]["content"]
+    assert repeated_path in optimized["messages"][0]["content"]

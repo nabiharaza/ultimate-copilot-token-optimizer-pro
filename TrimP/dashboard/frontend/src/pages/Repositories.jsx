@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Boxes, DollarSign, GitBranch, Layers, RefreshCw, Zap } from 'lucide-react'
+import { useRefreshTick } from '../hooks/useApi.js'
 
 function n(value) {
   return Number(value || 0).toLocaleString()
@@ -38,23 +39,37 @@ export default function Repositories() {
   const [repos, setRepos] = useState([])
   const [selectedRepo, setSelectedRepo] = useState(null)
   const [loading, setLoading] = useState(true)
+  const refreshTick = useRefreshTick()
+  const requestRef = useRef(null)
+  const lastPayloadRef = useRef(null)
 
-  async function loadRepositories() {
-    setLoading(true)
+  async function loadRepositories({ background = false } = {}) {
+    requestRef.current?.abort()
+    const controller = new AbortController()
+    requestRef.current = controller
+    if (!background) setLoading(true)
     try {
-      const res = await fetch('/api/repositories')
+      const res = await fetch('/api/repositories', { signal: controller.signal })
       const data = await res.json()
-      setRepos(data.repositories || [])
+      const nextRepos = data.repositories || []
+      // The dashboard polls this every second; skip the re-render (and the
+      // downstream repo-card work) entirely when nothing actually changed.
+      const signature = JSON.stringify(nextRepos)
+      if (signature !== lastPayloadRef.current) {
+        lastPayloadRef.current = signature
+        setRepos(nextRepos)
+      }
+    } catch (err) {
+      if (err?.name !== 'AbortError') throw err
     } finally {
-      setLoading(false)
+      if (!background) setLoading(false)
     }
   }
 
   useEffect(() => {
-    loadRepositories()
-    const id = setInterval(loadRepositories, 5000)
-    return () => clearInterval(id)
-  }, [])
+    loadRepositories({ background: refreshTick > 0 })
+    return () => requestRef.current?.abort()
+  }, [refreshTick])
 
   return (
     <main className="optimizer-page">
@@ -64,7 +79,7 @@ export default function Repositories() {
           <h1>Repositories</h1>
           <p>Compression performance by workspace, branch, and model.</p>
         </div>
-        <button className="icon-button" onClick={loadRepositories} title="Refresh"><RefreshCw size={16} /></button>
+        <button className="icon-button" onClick={loadRepositories} title="Refresh repositories" aria-label="Refresh repositories"><RefreshCw size={16} /></button>
       </header>
 
       {loading && repos.length === 0 ? (
@@ -80,7 +95,7 @@ export default function Repositories() {
                   <h2>{repo.repository}</h2>
                   <div className="muted">Last request {date(repo.last_session)}</div>
                 </div>
-                <button className="repo-detail-btn" onClick={() => setSelectedRepo(selectedRepo === repo.repository ? null : repo.repository)}>
+                <button className="repo-detail-btn" aria-expanded={selectedRepo === repo.repository} aria-label={`${selectedRepo === repo.repository ? 'Hide' : 'Show'} details for ${repo.repository}`} onClick={() => setSelectedRepo(selectedRepo === repo.repository ? null : repo.repository)}>
                   {selectedRepo === repo.repository ? 'Hide details' : 'Details'}
                 </button>
               </div>

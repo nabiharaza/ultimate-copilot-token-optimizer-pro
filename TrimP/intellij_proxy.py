@@ -51,7 +51,7 @@ CA_CERT = MITM_DIR / "mitmproxy-ca-cert.pem"
 COPILOT_HOST_PATTERN = (
     r"(^|\.)githubcopilot\.com(:[0-9]+)?$|"
     r"^copilot-proxy\.githubusercontent\.com(:[0-9]+)?$|"
-    r"^TrimP\.local(:[0-9]+)?$"
+    r"^(?i:trimp\.local)(:[0-9]+)?$"
 )
 SESSION_KEYS = (
     "conversation_id",
@@ -95,6 +95,23 @@ def _update_state(**updates: Any) -> dict[str, Any]:
     state["updated_at"] = _now_iso()
     _write_json(STATE_FILE, state)
     return state
+
+
+def _update_editor_signal(source: str, **updates: Any) -> dict[str, Any]:
+    state = _read_json(STATE_FILE)
+    signals = state.get("editor_signals")
+    if not isinstance(signals, dict):
+        signals = {}
+    current = signals.get(source)
+    if not isinstance(current, dict):
+        current = {}
+    current.update(updates)
+    current["updated_at"] = _now_iso()
+    signals[source] = current
+    state["editor_signals"] = signals
+    state["updated_at"] = _now_iso()
+    _write_json(STATE_FILE, state)
+    return current
 
 
 def _content_text(value: Any) -> str:
@@ -152,6 +169,66 @@ def _request_source(flow: Any, body: dict[str, Any] | None = None) -> str:
     if "rider" in values:
         return "rider-copilot-chat"
     return "pycharm-copilot-chat"
+
+
+def _is_copilot_host(host: str) -> bool:
+    return host.endswith("githubcopilot.com") or host == "copilot-proxy.githubusercontent.com"
+
+
+def _body_has_chat_payload(body: dict[str, Any]) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if isinstance(body.get("messages"), list) or isinstance(body.get("input"), (str, list)):
+        return True
+    if isinstance(body.get("model"), str) and any(key in body for key in ("prompt", "suffix", "stream")):
+        return True
+    for envelope in ("request", "payload", "body"):
+        nested = body.get(envelope)
+        if isinstance(nested, dict) and _body_has_chat_payload(nested):
+            return True
+    return False
+
+
+def _is_supported_copilot_request(host: str, path: str, method: str, body: dict[str, Any]) -> bool:
+    if not (_is_copilot_host(host) and method.upper() == "POST"):
+        return False
+    if "/chat/completions" in path or path.endswith("/responses") or path.endswith("/completions"):
+        return True
+    return _body_has_chat_payload(body)
+
+
+def _probe_response(flow: Any) -> None:
+    try:
+        body = json.loads(flow.request.get_text(strict=False) or "{}")
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    request_source = _request_source(flow, body)
+    raw_model, model_source = extract_model(body)
+    normalized_model = normalize_copilot_model(raw_model, fallback="probe")
+    has_payload = _body_has_chat_payload(body)
+    signal = _update_editor_signal(
+        request_source,
+        configured=True,
+        probe_ok=True,
+        last_probe_at=_now_iso(),
+        last_probe_model=normalized_model,
+        last_probe_model_source=model_source,
+        last_probe_payload_ok=has_payload,
+    )
+    flow.response = http.Response.make(
+        200,
+        json.dumps({
+            "status": "ok",
+            "intercepted": True,
+            "request_source": request_source,
+            "model": normalized_model,
+            "payload_ok": has_payload,
+            "signal": signal,
+        }),
+        {"Content-Type": "application/json"},
+    )
 
 
 def _assistant_text(payload: dict[str, Any]) -> str:
@@ -279,6 +356,65 @@ def _git_value(cwd: str, *args: str) -> str:
         return ""
 
 
+def _path_from_uri(value: str) -> str:
+    value = value.strip()
+    if value.startswith("file://"):
+        return urllib.parse.unquote(urllib.parse.urlparse(value).path)
+    return value
+
+
+def _looks_like_path(value: str) -> bool:
+    value = _path_from_uri(value)
+    return bool(
+        value.startswith(("/", "~/"))
+        or re.match(r"^[A-Za-z]:[\\/]", value)
+    )
+
+
+def _workspace_path_from_value(value: Any, depth: int = 0) -> str:
+    """Find an explicit editor workspace path without reading prompt prose."""
+    if depth > 8:
+        return ""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return _workspace_path_from_value(json.loads(stripped), depth + 1)
+            except Exception:
+                return ""
+        return _path_from_uri(value) if _looks_like_path(value) else ""
+    if isinstance(value, dict):
+        preferred_keys = (
+            "cwd", "currentWorkingDirectory", "workspaceFolder", "workspacePath",
+            "workspaceRoot", "rootPath", "rootUri", "folderUri", "uri", "fsPath",
+            "path",
+        )
+        for key in preferred_keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and _looks_like_path(candidate):
+                return _path_from_uri(candidate)
+            if isinstance(candidate, dict):
+                nested = _workspace_path_from_value(candidate, depth + 1)
+                if nested:
+                    return nested
+        for key in ("workspaceFolders", "folders", "roots"):
+            candidate = value.get(key)
+            nested = _workspace_path_from_value(candidate, depth + 1)
+            if nested:
+                return nested
+        for child in value.values():
+            if isinstance(child, (dict, list)) or (isinstance(child, str) and child.strip().startswith(("{", "["))):
+                nested = _workspace_path_from_value(child, depth + 1)
+                if nested:
+                    return nested
+    elif isinstance(value, list):
+        for child in value:
+            nested = _workspace_path_from_value(child, depth + 1)
+            if nested:
+                return nested
+    return ""
+
+
 def _latest_pycharm_workspace() -> str:
     logs = sorted(
         (Path.home() / "Library" / "Logs" / "JetBrains").glob("PyCharm*/idea.log"),
@@ -353,16 +489,17 @@ def _latest_vscode_workspace() -> str:
 
 def _workspace_context(body: dict[str, Any]) -> dict[str, str]:
     serialized = json.dumps(body, ensure_ascii=False)
+    cwd = _workspace_path_from_value(body)
     patterns = (
         r"Current working directory:\s*([^\n<\"]+)",
         r"currentWorkingDirectory[\"']?\s*[:=]\s*[\"']([^\"']+)",
     )
-    cwd = ""
-    for pattern in patterns:
-        match = re.search(pattern, serialized, flags=re.IGNORECASE)
-        if match:
-            cwd = match.group(1).strip()
-            break
+    if not cwd:
+        for pattern in patterns:
+            match = re.search(pattern, serialized, flags=re.IGNORECASE)
+            if match:
+                cwd = match.group(1).strip()
+                break
     is_vscode = "visual studio code" in serialized.lower() or "vscode" in serialized.lower()
     if not cwd and is_vscode:
         cwd = _latest_vscode_workspace()
@@ -494,7 +631,10 @@ class CopilotChatBridge:
 
     def request(self, flow: Any) -> None:
         host = flow.request.pretty_host.lower()
-        if host == "TrimP.local":
+        if host == "trimp.local":
+            if flow.request.path.lower().startswith("/probe"):
+                _probe_response(flow)
+                return
             state = _read_json(STATE_FILE)
             flow.response = http.Response.make(
                 200,
@@ -504,11 +644,7 @@ class CopilotChatBridge:
             return
 
         path = flow.request.path.lower()
-        if not (
-            (host.endswith("githubcopilot.com") or host == "copilot-proxy.githubusercontent.com")
-            and flow.request.method.upper() == "POST"
-            and ("/chat/completions" in path or path.endswith("/responses"))
-        ):
+        if not (_is_copilot_host(host) and flow.request.method.upper() == "POST"):
             return
 
         try:
@@ -516,6 +652,20 @@ class CopilotChatBridge:
         except Exception:
             return
         if not isinstance(original, dict):
+            return
+        if not _is_supported_copilot_request(host, path, flow.request.method, original):
+            request_source = _request_source(flow, original)
+            _update_editor_signal(
+                request_source,
+                last_unmatched_at=_now_iso(),
+                last_unmatched_path=f"{host}{flow.request.path}"[:240],
+            )
+            _update_state(
+                last_unmatched_copilot_at=_now_iso(),
+                last_unmatched_copilot=f"{host}{flow.request.path}"[:240],
+            )
+            if ctx is not None:
+                ctx.log.info(f"TrimP skipped unmatched Copilot POST {host}{flow.request.path}")
             return
 
         optimized, stats = self.optimizer.optimize_body(original)
@@ -548,6 +698,15 @@ class CopilotChatBridge:
             "started_at": time.time(),
         }
         flow.metadata["TrimP"] = metadata
+        _update_editor_signal(
+            request_source,
+            last_intercept_at=_now_iso(),
+            last_intercept_path=f"{host}{flow.request.path}"[:240],
+            last_model=normalized_model,
+            last_repository=workspace["repository"],
+            last_tokens_before=stats.tokens_before,
+            last_tokens_after=stats.tokens_after,
+        )
 
         flow.request.content = json.dumps(
             optimized, separators=(",", ":"), ensure_ascii=False
@@ -605,9 +764,18 @@ class CopilotChatBridge:
             _post_json(self.trace_url, trace)
             _flush_spool(self.trace_url)
             _update_state(last_trace_status="recorded", last_trace_at=_now_iso())
+            _update_editor_signal(
+                metadata.get("request_source", "ide-copilot-chat"),
+                last_logged_at=_now_iso(),
+                last_trace_status="recorded",
+            )
         except Exception as exc:
             _spool_trace(trace)
             _update_state(last_trace_status=f"spooled: {exc}", last_trace_at=_now_iso())
+            _update_editor_signal(
+                metadata.get("request_source", "ide-copilot-chat"),
+                last_trace_status=f"spooled: {exc}",
+            )
 
 
 addons = [CopilotChatBridge()]
@@ -748,6 +916,61 @@ def proxy_status() -> dict[str, Any]:
         }
     )
     return state
+
+
+def _integration_for_editor(editor: str) -> str:
+    value = str(editor or "").lower()
+    if "vs" in value or "code" in value:
+        return "vscode-chat"
+    if "rider" in value:
+        return "rider-chat"
+    return "pycharm-chat"
+
+
+def probe_proxy(editor: str = "pycharm", host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> dict[str, Any]:
+    """Send a localhost-only probe through the IDE proxy.
+
+    This verifies the editor proxy path can intercept HTTP traffic. It never
+    contacts GitHub because mitmproxy handles ``TrimP.local`` locally.
+    """
+    payload = {
+        "model": "trimp-probe",
+        "messages": [{"role": "user", "content": "trimp-probe"}],
+        "stream": False,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        "http://TrimP.local/probe",
+        data=raw,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Copilot-Integration-Id": _integration_for_editor(editor),
+            "X-Client-Name": str(editor or "editor"),
+        },
+        method="POST",
+    )
+    request.set_proxy(f"{host}:{port}", "http")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=3) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            data = json.loads(body or "{}")
+            return {
+                "editor": editor,
+                "status": "up" if data.get("intercepted") else "degraded",
+                "intercepted": bool(data.get("intercepted")),
+                "request_source": data.get("request_source"),
+                "model": data.get("model"),
+                "payload_ok": bool(data.get("payload_ok")),
+                "http_status": response.status,
+            }
+    except Exception as exc:
+        return {
+            "editor": editor,
+            "status": "down",
+            "intercepted": False,
+            "error": str(exc)[:160],
+        }
 
 
 def ca_is_trusted() -> bool:

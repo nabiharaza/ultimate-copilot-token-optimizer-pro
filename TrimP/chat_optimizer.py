@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from TrimP.compress_api import compress_text
+from TrimP.compression.context_codec import apply_anchor_aliases
 from TrimP.compression.bash import BashCompressor
+from TrimP.compression.advanced.conversation_compressor import ConversationCompressor
 from TrimP.compression.json_table import JsonTableCompressor
 from TrimP.compression.prompt_compression import PromptCompressor
 from TrimP.compression.search import SearchCompressor
@@ -99,6 +101,10 @@ class ChatPayloadOptimizer:
         self.bash = BashCompressor()
         self.search = SearchCompressor()
         self.json_table = JsonTableCompressor()
+        self.conversation = ConversationCompressor(
+            verbatim_tail=int(os.environ.get("TRIMP_CHAT_VERBATIM_TAIL", "3")),
+            summary_head=int(os.environ.get("TRIMP_CHAT_SUMMARY_HEAD", "6")),
+        )
 
     def optimize_body(self, body: dict[str, Any], *, enabled: bool | None = None) -> tuple[dict[str, Any], ChatOptimizationStats]:
         optimized = copy.deepcopy(body)
@@ -128,16 +134,18 @@ class ChatPayloadOptimizer:
 
         messages = optimized.get("messages")
         if isinstance(messages, list):
-            for idx, msg in enumerate(messages):
-                if not isinstance(msg, dict):
-                    continue
-                role = str(msg.get("role", "user"))
-                path = f"messages[{idx}].content"
-                content = msg.get("content")
-                if isinstance(content, str):
-                    msg["content"] = self._rewrite_text(content, path=path, role=role, changes=changes)
-                elif isinstance(content, list):
-                    msg["content"] = self._rewrite_content_parts(content, path=path, role=role, changes=changes)
+            optimized["messages"], sequence_rewritten = self._rewrite_message_sequence(messages, changes=changes)
+            if not sequence_rewritten:
+                for idx, msg in enumerate(optimized["messages"]):
+                    if not isinstance(msg, dict):
+                        continue
+                    role = str(msg.get("role", "user"))
+                    path = f"messages[{idx}].content"
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        msg["content"] = self._rewrite_text(content, path=path, role=role, changes=changes)
+                    elif isinstance(content, list):
+                        msg["content"] = self._rewrite_content_parts(content, path=path, role=role, changes=changes)
 
         input_value = optimized.get("input")
         if isinstance(input_value, str):
@@ -149,6 +157,79 @@ class ChatPayloadOptimizer:
 
         after = estimate_tokens(optimized)
         return optimized, ChatOptimizationStats(tokens_before=before, tokens_after=after, changes=changes)
+
+    def _rewrite_message_sequence(
+        self,
+        messages: list[Any],
+        *,
+        changes: list[CompressionChange],
+    ) -> tuple[list[Any], bool]:
+        """Compact old/middle user-assistant turns while preserving the recent tail.
+
+        This is the Headroom/TokenSplit-style path: preserve protocol-bearing
+        messages, keep the latest turns verbatim, summarize old turns, and
+        extract high-signal middle content. We only run it for plain text chat
+        histories because tool-call chains and structured content can be order
+        sensitive.
+        """
+        prefix: list[Any] = []
+        conversation: list[dict[str, str]] = []
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                return messages, False
+            role = str(msg.get("role", "user"))
+            content = msg.get("content")
+
+            if not conversation and role in {"system", "developer"}:
+                prefix.append(msg)
+                continue
+
+            if role not in {"user", "assistant"} or not isinstance(content, str):
+                return messages, False
+            if role == "assistant" and ("tool_calls" in msg or "function_call" in msg):
+                return messages, False
+            conversation.append({"role": role, "content": content})
+
+        if len(conversation) <= self.conversation.verbatim_tail + 2:
+            return messages, False
+
+        before = estimate_tokens(conversation)
+        compressed_conversation, metadata = self.conversation.compress(conversation)
+        if not isinstance(compressed_conversation, list):
+            return messages, False
+
+        after = estimate_tokens(compressed_conversation)
+        if after >= before:
+            return messages, False
+        saved_pct = (before - after) / before * 100.0
+        if saved_pct < self.min_savings_pct:
+            return messages, False
+
+        changes.append(
+            CompressionChange(
+                path="messages",
+                method=f"conversation-sequence:{metadata.get('method', 'ConversationCompressor')}",
+                tokens_before=before,
+                tokens_after=after,
+            )
+        )
+        compacted = [*prefix, *compressed_conversation]
+        encoded, codec_stats = apply_anchor_aliases(
+            compacted,
+            protected_tail=self.conversation.verbatim_tail,
+        )
+        if codec_stats.estimated_saved_tokens > 0:
+            changes.append(
+                CompressionChange(
+                    path="messages.aliases",
+                    method="context-codec:anchor-aliases",
+                    tokens_before=after,
+                    tokens_after=max(1, after - codec_stats.estimated_saved_tokens),
+                )
+            )
+            return encoded, True
+        return compacted, True
 
     def _rewrite_responses_input(
         self,

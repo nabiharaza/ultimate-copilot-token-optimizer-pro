@@ -150,8 +150,14 @@ class ConversationCompressor:
             sentences = self._split_sentences(content)
             
             if len(sentences) <= 2:
-                # Short message, keep as is
-                result.append(msg)
+                if len(content) > 360:
+                    result.append({
+                        'role': msg['role'],
+                        'content': self._compact_dense_message(content) + ' [...]'
+                    })
+                else:
+                    # Short message, keep as is
+                    result.append(msg)
                 continue
             
             # Score sentences (BM25 if available, else TF-IDF)
@@ -168,6 +174,8 @@ class ConversationCompressor:
                 top_n = compute_optimal_k(sentences, bias=0.8, min_k=1)
             else:
                 top_n = max(1, int(len(sentences) * 0.4))
+            if len(content) > 360:
+                top_n = min(top_n, max(1, int(len(sentences) * 0.4)))
             
             top_indices = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:top_n]
             top_indices.sort()  # Maintain original order
@@ -180,6 +188,47 @@ class ConversationCompressor:
             })
         
         return result
+
+    def _compact_dense_message(self, text: str) -> str:
+        """Compress long single-paragraph turns without losing anchors.
+
+        Chat histories often contain dense, run-on tool or assistant summaries
+        that do not split into many sentences. For those, preserve concrete
+        anchors (paths, identifiers, errors, issue IDs) and a small amount of
+        surrounding prose instead of keeping the whole turn.
+        """
+        protected_patterns = [
+            r'(?:[\w.-]+/)+[\w.-]+',  # file paths
+            r'`[^`]{2,120}`',  # backticked symbols/commands
+            r'\b[A-Z][A-Z0-9_]{2,}\b',  # constants/error codes
+            r'\b[\w.-]+Error\b',
+            r'\b\d{4,}\b',
+        ]
+        anchors = []
+        for pattern in protected_patterns:
+            anchors.extend(re.findall(pattern, text))
+
+        deduped = []
+        seen = set()
+        for anchor in anchors:
+            key = anchor.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(anchor[:120])
+            if len(deduped) >= 10:
+                break
+
+        clean = re.sub(r'\s+', ' ', text).strip()
+        first = clean[:220].strip()
+        last = clean[-120:].strip() if len(clean) > 420 else ''
+        parts = []
+        if deduped:
+            parts.append('anchors: ' + ', '.join(deduped))
+        parts.append(first)
+        if last and last not in first:
+            parts.append('... ' + last)
+        return ' | '.join(parts)
     
     def _split_sentences(self, text: str) -> List[str]:
         """Split text into sentences."""

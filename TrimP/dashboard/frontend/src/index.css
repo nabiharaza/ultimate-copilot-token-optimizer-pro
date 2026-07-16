@@ -338,6 +338,12 @@ h3 { font-size: 0.95rem; color: var(--muted); margin-bottom: 0.5rem; }
 .settings-ide-health { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.85rem; color:var(--muted); font-size:.78rem; }
 .settings-ide-health span { display:inline-flex; align-items:center; gap:.35rem; padding:.35rem .55rem; border-radius:999px; background:#f1f7f4; }
 .settings-ide-health i { width:6px; height:6px; border-radius:50%; background:#01a982; }
+.settings-probe-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.5rem; margin-top:.7rem; }
+.settings-probe-card { min-width:0; display:grid; grid-template-columns:auto 1fr; align-items:center; gap:.2rem .4rem; padding:.55rem; border:1px solid #cde9dc; border-radius:8px; background:#f7fbf9; font-size:.76rem; }
+.settings-probe-card.down { border-color:#e9c5c5; background:#fffafa; }
+.settings-probe-card span { display:flex; color:#087f5b; }.settings-probe-card.down span { color:#a61b1b; }
+.settings-probe-card small, .settings-probe-card em { grid-column:1 / -1; min-width:0; overflow:hidden; color:var(--muted); font-style:normal; text-overflow:ellipsis; white-space:nowrap; }
+.settings-probe-card em { color:#087f5b; }
 .system-design-bar { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:.8rem 1rem; margin:0 0 1rem; border:1px solid var(--border); border-radius:10px; background:#fff; }
 .system-design-bar div { display:grid; gap:.2rem; }
 .system-design-bar span { color:var(--muted); font-size:.8rem; }

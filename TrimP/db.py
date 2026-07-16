@@ -383,6 +383,17 @@ CREATE INDEX IF NOT EXISTS idx_debug_turns_session ON copilot_debug_turns(parent
 CREATE INDEX IF NOT EXISTS idx_debug_turns_time ON copilot_debug_turns(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_validation_exec_run ON validation_executions(run_id);
 CREATE INDEX IF NOT EXISTS idx_validation_events_run ON validation_events(run_id, sequence);
+-- These 7 tables are all queried by session_id (session detail/checkpoint
+-- lookups, quality/coaching commands) but had no index — full table scans
+-- that get slower as usage history grows. Cheap to add, safe (IF NOT
+-- EXISTS + idempotent CREATE INDEX runs fine against existing installs).
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session    ON checkpoints(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_files_session   ON session_files(session_id);
+CREATE INDEX IF NOT EXISTS idx_model_routing_session   ON model_routing(session_id);
+CREATE INDEX IF NOT EXISTS idx_token_budgets_session   ON token_budgets(session_id);
+CREATE INDEX IF NOT EXISTS idx_memory_audits_session   ON memory_audits(session_id);
+CREATE INDEX IF NOT EXISTS idx_loop_detections_session ON loop_detections(session_id);
+CREATE INDEX IF NOT EXISTS idx_activity_modes_session  ON activity_modes(session_id);
 """
 
 # Safely add new columns to existing DBs without destroying data
@@ -407,8 +418,28 @@ _MIGRATIONS = [
 ]
 
 
+def _secure_permissions(path: Path, dir_mode: int = 0o700, file_mode: int = 0o600) -> None:
+    """Best-effort: restrict ~/.trimp to the current user only.
+
+    TrimPy's DB holds full prompts and code context (and, despite the
+    redaction pass in secret_redaction.py, is not a guaranteed-secret-free
+    store). On a shared/multi-user machine the default umask (0755 dirs /
+    0644 files) would let any other local user read it. Applied on every
+    call (not just at creation) so existing installs get tightened too.
+    POSIX-only; a no-op on platforms where chmod semantics don't apply.
+    """
+    try:
+        if path.is_dir():
+            path.chmod(dir_mode)
+        elif path.exists():
+            path.chmod(file_mode)
+    except OSError:
+        pass
+
+
 def _ensure_db_dir() -> None:
     DB_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_permissions(DB_DIR)
 
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
@@ -432,6 +463,10 @@ def get_connection() -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous=NORMAL")
         _local.conn = conn
         _apply_schema(conn)
+        _secure_permissions(DB_PATH)
+        # WAL mode leaves -wal/-shm sidecar files that also hold live data.
+        for suffix in ("-wal", "-shm"):
+            _secure_permissions(Path(str(DB_PATH) + suffix))
     return _local.conn
 
 
