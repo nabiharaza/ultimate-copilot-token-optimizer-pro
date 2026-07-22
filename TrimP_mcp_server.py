@@ -60,6 +60,9 @@ except Exception as e:
     TRIMP_AVAILABLE = False
     _err = str(e)
 
+import os
+COMPRESS_MIN_CHARS = int(os.environ.get("TRIMP_MIN_COMPRESS_CHARS", "500"))
+
 DB_PATH = Path.home() / ".trimp" / "TrimP.db"
 
 
@@ -231,7 +234,7 @@ def TrimP_bash(command: str, working_dir: str = "") -> str:
     elif "log" in cmd_lower or "journal" in cmd_lower:
         mode = "log"
 
-    if len(raw) < 500:
+    if len(raw) < COMPRESS_MIN_CHARS:
         return raw + exit_info
 
     compressed, meta = _compress(raw, mode)
@@ -266,7 +269,7 @@ def TrimP_read_file(path: str) -> str:
     except Exception as e:
         return f"Error reading file: {e}"
 
-    if len(content) < 500:
+    if len(content) < COMPRESS_MIN_CHARS:
         return content
 
     # Detect mode from extension

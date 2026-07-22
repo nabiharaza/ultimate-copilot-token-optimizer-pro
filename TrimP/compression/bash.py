@@ -204,7 +204,7 @@ def _compress_with_best_algo(text: str) -> tuple[bytes | None, str]:
     # Try zstd (best compression ratio)
     if HAS_ZSTD:
         try:
-            cctx = zstd.ZstdCompressor(level=19)  # max compression
+            cctx = zstd.ZstdCompressor(level=22)  # max compression
             compressed = cctx.compress(text_bytes)
             if len(compressed) < best_size:
                 best_size = len(compressed)

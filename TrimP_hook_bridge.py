@@ -45,6 +45,9 @@ try:
 except Exception:
     TRIMP_AVAILABLE = False
 
+import os
+COMPRESS_MIN_CHARS = int(os.environ.get("TRIMP_MIN_COMPRESS_CHARS", "500"))
+
 DB_PATH = Path.home() / ".trimp" / "TrimP.db"
 MAX_STDIN = 4 * 1024 * 1024  # 4MB max
 
@@ -260,7 +263,7 @@ def handle_post_tool_use():
     session_id = _session_id(payload)
     output = _extract_tool_output(payload)
 
-    if not output or len(output) < 500:
+    if not output or len(output) < COMPRESS_MIN_CHARS:
         return  # Not worth compressing
     
     # Compress based on tool type
