@@ -11,6 +11,7 @@ import gzip
 import re
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 # Try to import advanced compression (optional)
@@ -204,7 +205,16 @@ def _compress_with_best_algo(text: str) -> tuple[bytes | None, str]:
     # Try zstd (best compression ratio)
     if HAS_ZSTD:
         try:
-            cctx = zstd.ZstdCompressor(level=22)  # max compression
+            dict_path = Path.home() / ".trimp" / "trimp.zstd.dict"
+            if dict_path.exists():
+                try:
+                    with open(dict_path, "rb") as _fh:
+                        _dict = _fh.read()
+                    cctx = zstd.ZstdCompressor(level=22, dict_data=zstd.ZstdCompressionDict(_dict))
+                except Exception:
+                    cctx = zstd.ZstdCompressor(level=22)  # max compression
+            else:
+                cctx = zstd.ZstdCompressor(level=22)  # max compression
             compressed = cctx.compress(text_bytes)
             if len(compressed) < best_size:
                 best_size = len(compressed)
