@@ -181,22 +181,93 @@ class CompressionProxy:
                 
                 # Record turn
                 elapsed = time.time() - start
+
+                # Extract precise upstream usage metrics when available
+                usage_info = resp_data.get("usage", {}) or {}
+                # Output tokens fallback chain
+                output_tokens = 0
+                for k in ("output_tokens", "completion_tokens", "response_tokens", "content_tokens", "generated_tokens", "completion_token_count"):
+                    if k in usage_info and usage_info[k] is not None:
+                        try:
+                            output_tokens = int(usage_info[k])
+                            break
+                        except Exception:
+                            pass
+
+                # Input tokens: prefer explicit fields, then total - output, then fallback to estimated tokens_after
+                if "input_tokens" in usage_info and usage_info.get("input_tokens") is not None:
+                    try:
+                        input_tokens = int(usage_info.get("input_tokens"))
+                    except Exception:
+                        input_tokens = tokens_after
+                elif "prompt_tokens" in usage_info and usage_info.get("prompt_tokens") is not None:
+                    try:
+                        input_tokens = int(usage_info.get("prompt_tokens"))
+                    except Exception:
+                        input_tokens = tokens_after
+                elif "total_tokens" in usage_info and usage_info.get("total_tokens") is not None and output_tokens:
+                    try:
+                        input_tokens = max(0, int(usage_info.get("total_tokens")) - output_tokens)
+                    except Exception:
+                        input_tokens = tokens_after
+                else:
+                    input_tokens = tokens_after
+
+                cached_tokens = 0
+                for k in ("cached_tokens", "prompt_cache_tokens"):
+                    if k in usage_info and usage_info[k] is not None:
+                        try:
+                            cached_tokens = int(usage_info[k])
+                            break
+                        except Exception:
+                            pass
+
+                total_tokens = int(usage_info.get("total_tokens")) if usage_info.get("total_tokens") is not None else (input_tokens + output_tokens)
+
+                # Normalize model and compute cost estimate
+                try:
+                    from TrimP.model_utils import extract_model, actual_cost
+                    raw_model, model_name = extract_model(body, fallback=os.environ.get("COPILOT_MODEL", ""))
+                except Exception:
+                    raw_model = None
+                    model_name = os.environ.get("COPILOT_MODEL", "")
+
+                cost_estimate = 0.0
+                try:
+                    cost_estimate = actual_cost(input_tokens, output_tokens, cached_tokens, model_name)
+                except Exception:
+                    cost_estimate = 0.0
+
+                # Persist turn using upstream-reported tokens when available
                 record_turn(
                     self.session_id,
                     turn_index=self._get_turn_count(),
                     user_message=str(original_messages[-1] if original_messages else ""),
                     assistant_response=str(resp_data.get("content", "")),
-                    tokens_in=tokens_after,
-                    tokens_out=resp_data.get("usage", {}).get("output_tokens", 0),
+                    tokens_in=input_tokens,
+                    tokens_out=output_tokens,
                     tokens_saved=tokens_saved,
+                    model=model_name,
                 )
-                
-                console.print(f"[green]✓[/green] Response received in {elapsed:.1f}s")
-                
+
+                # Update last_stats with upstream usage and cost for the dashboard / status endpoint
+                stats_dict = stats.as_dict()
+                stats_dict["upstream_usage"] = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cached_tokens": cached_tokens,
+                    "total_tokens": total_tokens,
+                }
+                stats_dict["upstream_model"] = model_name
+                stats_dict["upstream_cost"] = cost_estimate
+                self.last_stats = stats_dict
+
+                console.print(f"[green]✓[/green] Response received in {elapsed:.1f}s — tokens: {input_tokens:,} → {output_tokens:,} ; cost: ${cost_estimate:.6f}")
+
                 return Response(
                     content=response.content,
                     status_code=response.status_code,
-                    headers=self._response_headers(response.headers, stats),
+                    headers=self._response_headers(response.headers, stats, usage_metrics=stats_dict["upstream_usage"], model=model_name),
                 )
             
             except Exception as e:
@@ -294,12 +365,25 @@ class CompressionProxy:
 
         return count_tokens(str(text)).tokens
 
-    def _response_headers(self, upstream_headers: Any, stats) -> dict[str, str]:
+    def _response_headers(self, upstream_headers: Any, stats, usage_metrics: dict | None = None, model: str | None = None) -> dict[str, str]:
         headers = dict(upstream_headers)
         headers["x-TrimP-tokens-before"] = str(stats.tokens_before)
         headers["x-TrimP-tokens-after"] = str(stats.tokens_after)
         headers["x-TrimP-tokens-saved"] = str(stats.tokens_saved)
         headers["x-TrimP-savings-pct"] = f"{stats.savings_pct:.2f}"
+
+        if usage_metrics:
+            headers["x-TrimP-upstream-input-tokens"] = str(usage_metrics.get("input_tokens", 0))
+            headers["x-TrimP-upstream-output-tokens"] = str(usage_metrics.get("output_tokens", 0))
+            headers["x-TrimP-upstream-cached-tokens"] = str(usage_metrics.get("cached_tokens", 0))
+            headers["x-TrimP-upstream-total-tokens"] = str(usage_metrics.get("total_tokens", 0))
+            try:
+                from TrimP.model_utils import actual_cost
+                cost = actual_cost(int(usage_metrics.get("input_tokens", 0)), int(usage_metrics.get("output_tokens", 0)), int(usage_metrics.get("cached_tokens", 0)), model)
+                headers["x-TrimP-upstream-cost"] = f"{cost:.6f}"
+            except Exception:
+                pass
+
         return headers
 
     def _aggregate_stats(self) -> dict[str, Any]:
