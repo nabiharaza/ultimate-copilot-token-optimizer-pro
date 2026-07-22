@@ -1,177 +1,73 @@
-"""
-LLMLinguaLite - Generic prompt compression using word-level pruning.
+"""Compatibility wrapper for the former word-frequency compressor.
 
-Algorithm:
-- Self-information scoring using word frequency
-- Iterative token-level pruning to meet budget
-- Perplexity approximation (no model needed)
-- Typical savings: 30-60%
-
-Based on: LLMLingua paper (Microsoft Research).
-Reference: https://arxiv.org/abs/2310.05736
+The original implementation deleted individual words using within-document
+frequency, which could remove punctuation, negations, and syntax. Existing
+imports keep working, but this module now performs complete-sentence,
+query-aware extractive compression. Real LLMLingua-2 is available through the
+optional adapter in :mod:`TrimP.compression.advanced.llmlingua2`.
 """
+
+from __future__ import annotations
 
 import re
-from collections import Counter
-from typing import List, Tuple, Dict
-import math
+from typing import Any
+
+from TrimP.compression.verification import extract_protected_anchors
+from TrimP.tokenization import count_tokens
 
 
 class LLMLinguaLite:
-    """Compress prompts by removing low-information words."""
-    
+    """Deprecated name for safe query-aware extractive compression."""
+
     def __init__(self, target_ratio: float = 0.5, preserve_questions: bool = True):
-        """
-        Args:
-            target_ratio: Target to keep (0.5 = keep 50%)
-            preserve_questions: Always keep question words
-        """
-        self.target_ratio = target_ratio
+        self.target_ratio = max(0.2, min(target_ratio, 1.0))
         self.preserve_questions = preserve_questions
-        
-        # Question words should be preserved
-        self.question_words = {
-            'what', 'when', 'where', 'who', 'whom', 'whose', 'why', 'how',
-            'which', 'can', 'could', 'would', 'should', 'will', 'do', 'does',
-            'is', 'are', 'was', 'were'
+
+    def compress(self, text: str, *, query: str = "") -> tuple[str, dict[str, Any]]:
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n{2,}", text) if part.strip()]
+        if len(sentences) <= 1 or len(text) < 120:
+            return text, self._metadata(text, text, len(sentences), len(sentences), query)
+        query_terms = set(re.findall(r"[A-Za-z_][A-Za-z0-9_.:/-]{2,}", query.lower()))
+        anchors = extract_protected_anchors(text)
+        anchor_values = {value for values in anchors.values() for value in values}
+        scored: list[tuple[float, int, str]] = []
+        for index, sentence in enumerate(sentences):
+            terms = set(re.findall(r"[A-Za-z_][A-Za-z0-9_.:/-]{2,}", sentence.lower()))
+            score = len(query_terms & terms) * 4.0
+            score += sum(6.0 for value in anchor_values if value in sentence)
+            score += 1.0 if index == 0 else 0.0
+            score += 0.75 if index == len(sentences) - 1 else 0.0
+            score += 2.0 if self.preserve_questions and "?" in sentence else 0.0
+            scored.append((score, index, sentence))
+        keep = max(1, int(round(len(sentences) * self.target_ratio)))
+        chosen = sorted(sorted(scored, reverse=True)[:keep], key=lambda item: item[1])
+        omitted = len(sentences) - len(chosen)
+        compressed = " ".join(item[2] for item in chosen)
+        if omitted:
+            compressed += f" […{omitted}]"
+        if count_tokens(compressed).tokens >= count_tokens(text).tokens:
+            compressed = text
+            omitted = 0
+        return compressed, self._metadata(text, compressed, len(sentences), len(chosen), query)
+
+    @staticmethod
+    def _metadata(text: str, compressed: str, total: int, kept: int, query: str) -> dict[str, Any]:
+        before = count_tokens(text).tokens
+        after = count_tokens(compressed).tokens
+        return {
+            "method": "QueryAwareExtractive",
+            "deprecated_alias": "LLMLinguaLite",
+            "sentences_total": total,
+            "sentences_kept": kept,
+            "query_aware": bool(query.strip()),
+            "savings_pct": round(max(0, before - after) / before * 100, 2) if before else 0.0,
         }
-    
-    def compress(self, text: str) -> Tuple[str, dict]:
-        """
-        Compress text by pruning low-information words.
-        
-        Returns:
-            (compressed_text, metadata)
-        """
-        # Tokenize into words
-        tokens = self._tokenize(text)
-        
-        if len(tokens) < 20:
-            # Too short
-            return text, {
-                'method': 'LLMLinguaLite',
-                'tokens_kept': len(tokens),
-                'tokens_total': len(tokens),
-                'savings_pct': 0
-            }
-        
-        # Calculate target token count
-        target_tokens = max(int(len(tokens) * self.target_ratio), 10)
-        
-        # Score each token by self-information
-        scores = self._score_tokens(tokens)
-        
-        # Select top N tokens
-        token_indices = list(range(len(tokens)))
-        
-        # Sort by score descending
-        sorted_indices = sorted(token_indices, key=lambda i: scores[i], reverse=True)
-        
-        # Take top N
-        selected_indices = sorted(sorted_indices[:target_tokens])
-        
-        # Reconstruct text
-        selected_tokens = [tokens[i] for i in selected_indices]
-        compressed = self._reconstruct(selected_tokens, tokens, selected_indices)
-        
-        original_chars = len(text)
-        compressed_chars = len(compressed)
-        savings_pct = ((original_chars - compressed_chars) / original_chars * 100) if original_chars > 0 else 0
-        
-        return compressed, {
-            'method': 'LLMLinguaLite',
-            'tokens_kept': len(selected_indices),
-            'tokens_total': len(tokens),
-            'savings_pct': round(savings_pct, 1),
-            'self_information_pruning': True
-        }
-    
-    def _tokenize(self, text: str) -> List[Dict]:
-        """
-        Tokenize text into words with metadata.
-        
-        Returns:
-            List of {'word': str, 'original': str, 'start': int, 'end': int}
-        """
-        tokens = []
-        
-        # Find all words (alphanumeric sequences)
-        for match in re.finditer(r'\b[\w]+\b', text):
-            tokens.append({
-                'word': match.group(0).lower(),
-                'original': match.group(0),
-                'start': match.start(),
-                'end': match.end()
-            })
-        
-        return tokens
-    
-    def _score_tokens(self, tokens: List[Dict]) -> List[float]:
-        """
-        Score tokens using self-information.
-        
-        Self-information I(w) = -log(P(w))
-        Higher score = more informative (rare words)
-        """
-        # Count word frequencies
-        words = [t['word'] for t in tokens]
-        word_counts = Counter(words)
-        total_words = len(words)
-        
-        # Calculate self-information for each token
-        scores = []
-        for token in tokens:
-            word = token['word']
-            
-            # Preserve question words
-            if self.preserve_questions and word in self.question_words:
-                scores.append(1000.0)  # Very high score
-                continue
-            
-            # Preserve proper nouns (capitalized)
-            if token['original'][0].isupper() and word not in {'i', 'a'}:
-                scores.append(100.0)  # High score
-                continue
-            
-            # Calculate self-information
-            freq = word_counts[word]
-            prob = freq / total_words
-            self_info = -math.log(prob) if prob > 0 else 0
-            
-            # Boost longer words (more specific)
-            length_bonus = min(len(word) / 10, 2.0)
-            
-            score = self_info + length_bonus
-            scores.append(score)
-        
-        return scores
-    
-    def _reconstruct(self, selected_tokens: List[Dict], all_tokens: List[Dict], selected_indices: List[int]) -> str:
-        """Reconstruct text from selected tokens."""
-        if not selected_tokens:
-            return ""
-        
-        # Build ranges of selected tokens
-        result_parts = []
-        
-        for token in selected_tokens:
-            result_parts.append(token['original'])
-        
-        # Join with spaces
-        return ' '.join(result_parts)
 
 
-def compress_llm_lingua(text: str, target_ratio: float = 0.5, preserve_questions: bool = True) -> Tuple[str, dict]:
-    """
-    Convenience function for LLMLingua-style compression.
-    
-    Args:
-        text: Text to compress
-        target_ratio: How much to keep
-        preserve_questions: Keep question words
-    
-    Returns:
-        (compressed_text, metadata)
-    """
-    compressor = LLMLinguaLite(target_ratio=target_ratio, preserve_questions=preserve_questions)
-    return compressor.compress(text)
+def compress_llm_lingua(
+    text: str,
+    target_ratio: float = 0.5,
+    preserve_questions: bool = True,
+    query: str = "",
+) -> tuple[str, dict[str, Any]]:
+    return LLMLinguaLite(target_ratio=target_ratio, preserve_questions=preserve_questions).compress(text, query=query)

@@ -11,11 +11,13 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -42,6 +44,7 @@ MITM_DIR = DATA_DIR / "mitmproxy"
 STATE_FILE = DATA_DIR / "state.json"
 PID_FILE = DATA_DIR / "proxy.pid"
 LOG_FILE = DATA_DIR / "proxy.log"
+WORKER_LOG_FILE = DATA_DIR / "optimizer_worker.log"
 SPOOL_FILE = DATA_DIR / "trace-spool.jsonl"
 CONFIG_STATE_FILE = DATA_DIR / "ide-config.json"
 DEFAULT_PORT = 8767
@@ -557,6 +560,60 @@ def _flush_spool(trace_url: str) -> None:
         SPOOL_FILE.unlink(missing_ok=True)
 
 
+def _python_is_usable(python: str) -> bool:
+    """Check a candidate interpreter is >=3.10 (TrimP's own requires-python)
+    and can actually import TrimP, without paying the cost of a real worker
+    startup (ChatPayloadOptimizer construction, model warm-up, etc).
+
+    This exists because `shutil.which("python3")` can resolve to whatever
+    happens to be first on PATH — on a real machine that's easily an old
+    system/framework Python (e.g. 3.9) that predates PEP 604 `X | None`
+    union-type syntax used throughout TrimP's compression modules. Under a
+    too-old interpreter, importing TrimP crashes at class-definition time,
+    which previously surfaced only as a confusing BrokenPipeError/
+    JSONDecodeError in the caller — every request failing identically,
+    regardless of size or content, because it never even reached the
+    request loop.
+    """
+    try:
+        result = subprocess.run(
+            [python, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"],
+            timeout=5,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _find_worker_python() -> str:
+    """Pick an interpreter for the optimizer_worker subprocess.
+
+    Priority: explicit TRIMP_PYTHON override (trusted as-is, no validation)
+    → the project's own .venv/venv (most likely to actually match
+    requires-python and have TrimP's dependencies installed) → whatever
+    `python3` resolves to on PATH → this process's own interpreter. Each
+    non-explicit candidate is version-checked before being accepted so a
+    stale system Python doesn't get silently used and fail on every request.
+    """
+    explicit = os.environ.get("TRIMP_PYTHON")
+    if explicit:
+        return explicit
+    candidates = [
+        str(PROJECT_ROOT / ".venv" / "bin" / "python3"),
+        str(PROJECT_ROOT / "venv" / "bin" / "python3"),
+        shutil.which("python3") or "",
+        sys.executable,
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists() and _python_is_usable(candidate):
+            return candidate
+    # Nothing validated — fall back to the old best-effort behavior so this
+    # doesn't hard-fail proxy startup, but the crash (if any) is now at
+    # least visible via WORKER_LOG_FILE instead of silently discarded.
+    return shutil.which("python3") or sys.executable
+
+
 class _ExternalOptimizer:
     """Use the normal TrimP runtime outside mitmproxy's restricted Python.
 
@@ -565,36 +622,96 @@ class _ExternalOptimizer:
     and delegates optimization to the project's regular Python interpreter.
     """
 
-    _SCRIPT = (
-        "import json,sys; "
-        "from TrimP.chat_optimizer import ChatPayloadOptimizer; "
-        "body=json.load(sys.stdin); optimized,stats=ChatPayloadOptimizer().optimize_body(body); "
-        "json.dump({'body':optimized,'stats':stats.as_dict()},sys.stdout,separators=(',',':'))"
-    )
-
     def __init__(self) -> None:
-        self.python = os.environ.get("TRIMP_PYTHON") or shutil.which("python3") or sys.executable
+        self.python = _find_worker_python()
+        self.timeout = max(3.0, float(os.environ.get("TRIMP_OPTIMIZER_TIMEOUT_SECONDS", "20")))
+        self.process: subprocess.Popen[str] | None = None
+        self.lock = threading.RLock()
+        self.request_id = 0
+        self._start()
 
-    def optimize_body(self, body: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+    def _start(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
         env = dict(os.environ)
         env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-        try:
-            result = subprocess.run(
-                [self.python, "-c", self._SCRIPT],
-                input=json.dumps(body, ensure_ascii=False),
-                text=True,
-                capture_output=True,
-                timeout=12,
-                cwd=str(PROJECT_ROOT),
-                env=env,
-                check=True,
-            )
-            payload = json.loads(result.stdout)
-            return payload["body"], _Stats(payload["stats"])
-        except Exception as exc:
-            if ctx is not None:
-                ctx.log.warn(f"TrimP optimizer unavailable; forwarding original payload: {exc}")
-            return body, _Stats({"tokens_before": 0, "tokens_after": 0, "tokens_saved": 0, "savings_pct": 0, "changes": []})
+        # stderr used to go to DEVNULL. If the worker crashed on startup
+        # (e.g. an exception constructing ChatPayloadOptimizer, or a fatal
+        # error), every subsequent request would fail with a confusing
+        # BrokenPipeError/JSONDecodeError and there was no way to see why —
+        # the actual traceback was silently discarded. Appending it to a log
+        # file instead keeps stdout clean for the JSON-lines protocol while
+        # making crashes diagnosable.
+        WORKER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        stderr_log = open(WORKER_LOG_FILE, "a", encoding="utf-8")
+        self.process = subprocess.Popen(
+            [self.python, "-u", "-m", "TrimP.optimizer_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_log,
+            text=True,
+            bufsize=1,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+        )
+        stderr_log.close()  # child keeps its own fd; safe to close our copy
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    @staticmethod
+    def _fallback_stats(body: dict[str, Any], reason: str) -> dict[str, Any]:
+        # The mitmproxy Python cannot use TrimPy's tokenizer stack. A labeled
+        # character estimate is still materially more truthful than 0 -> 0.
+        estimate = max(1, len(json.dumps(body, separators=(",", ":"), ensure_ascii=False)) // 4)
+        return {
+            "architecture_version": "context-compiler-v1",
+            "tokens_before": estimate,
+            "tokens_after": estimate,
+            "tokens_saved": 0,
+            "savings_pct": 0.0,
+            "tokenizer": "chars/4:runtime-fallback-estimate",
+            "token_count_exact": False,
+            "protected_anchor_retention_pct": 100.0,
+            "candidate_anchor_retention_pct": 100.0,
+            "fallbacks": [{"path": "$", "method": "optimizer-worker", "reason": reason}],
+            "changes": [],
+        }
+
+    def _exchange(self, body: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+        self._start()
+        process = self.process
+        if process is None or process.stdin is None or process.stdout is None:
+            raise RuntimeError("optimizer worker did not start")
+        self.request_id += 1
+        request_id = self.request_id
+        process.stdin.write(
+            json.dumps({"id": request_id, "body": body}, separators=(",", ":"), ensure_ascii=False) + "\n"
+        )
+        process.stdin.flush()
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        ready = selector.select(self.timeout)
+        selector.close()
+        if not ready:
+            self.close()
+            raise TimeoutError(f"optimizer exceeded {self.timeout:.0f}s latency budget")
+        payload = json.loads(process.stdout.readline())
+        if payload.get("id") != request_id or not payload.get("ok"):
+            raise RuntimeError(str(payload.get("error") or "invalid optimizer response"))
+        return payload["body"], _Stats(payload["stats"])
+
+    def optimize_body(self, body: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+        with self.lock:
+            try:
+                return self._exchange(body)
+            except Exception as exc:
+                if ctx is not None:
+                    ctx.log.warn(f"TrimP optimizer unavailable; forwarding original payload: {exc}")
+                return body, _Stats(self._fallback_stats(body, f"{type(exc).__name__}: {exc}"))
 
 
 class _Stats:
@@ -627,6 +744,7 @@ class CopilotChatBridge:
         )
 
     def done(self) -> None:
+        self.optimizer.close()
         _update_state(status="stopped", pid=None)
 
     def request(self, flow: Any) -> None:

@@ -1,7 +1,5 @@
 """
-Advanced compression algorithms for token optimization.
-
-All 10 world-class algorithms from the research papers.
+Advanced typed compression algorithms for token optimization.
 """
 
 from .code_context_trimmer import CodeContextTrimmer, compress_code_context
@@ -12,6 +10,7 @@ from .image_description_reducer import ImageDescriptionReducer, compress_image_d
 from .architecture_context_packer import ArchitectureContextPacker, compress_architecture
 from .semantic_chunker import SemanticChunker, compress_semantic
 from .llm_lingua_lite import LLMLinguaLite, compress_llm_lingua
+from .llmlingua2 import LLMLingua2Compressor
 from .mcp_tool_trimmer import MCPToolTrimmer, compress_mcp_tools
 from .universal_optimizer import UniversalOptimizer, compress_universal
 
@@ -25,6 +24,7 @@ __all__ = [
     'ArchitectureContextPacker',
     'SemanticChunker',
     'LLMLinguaLite',
+    'LLMLingua2Compressor',
     'MCPToolTrimmer',
     'UniversalOptimizer',
     

@@ -8,6 +8,27 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+# Precompiled once at import time and reused for every line of every file
+# compressed (these run in a tight per-line loop, so avoiding re-parsing the
+# pattern string on each call matters here more than in the other compressors).
+_PY_CLASS = re.compile(r"^class\s+\w+")
+_PY_DEF = re.compile(r"^(async\s+)?def\s+\w+")
+_PY_CONST = re.compile(r"^[A-Z_]{2,}\s*=")
+
+_TS_FUNCTION = re.compile(r"^(export\s+)?(async\s+)?function\s+")
+_TS_CLASS = re.compile(r"^(export\s+)?(default\s+)?class\s+")
+_TS_TYPE = re.compile(r"^(export\s+)?(interface|type|enum)\s+")
+_TS_CONST_FN = re.compile(r"^(export\s+)?(const|let|var)\s+\w+\s*[=:]\s*(async\s+)?\(")
+
+_GO_FUNC = re.compile(r"^func\s+")
+
+_JAVA_MEMBER = re.compile(r"^(public|private|protected|abstract|static|final|class|interface|enum)")
+
+_RUST_FN = re.compile(r"^(pub\s+)?(async\s+)?fn\s+")
+_RUST_TYPE = re.compile(r"^(pub\s+)?(struct|enum|trait|impl|type)\s+")
+
+_RUBY_DECL = re.compile(r"^(require|include|module|class|def)\s+")
+
 
 class SkeletonCompressor:
     """Extract structural skeleton from source files."""
@@ -55,13 +76,13 @@ def _python_skeleton(src: str) -> str:
             continue
 
         # class def
-        if re.match(r"^class\s+\w+", stripped):
+        if _PY_CLASS.match(stripped):
             lines.append(line)
             in_func_body = False
             continue
 
         # function / method signatures
-        if re.match(r"^(async\s+)?def\s+\w+", stripped):
+        if _PY_DEF.match(stripped):
             lines.append(line)
             in_func_body = True
             continue
@@ -72,7 +93,7 @@ def _python_skeleton(src: str) -> str:
             continue
 
         # module-level constants / type aliases (short)
-        if re.match(r"^[A-Z_]{2,}\s*=", stripped) and len(line) < 120:
+        if _PY_CONST.match(stripped) and len(line) < 120:
             lines.append(line)
             continue
 
@@ -95,17 +116,17 @@ def _ts_js_skeleton(src: str) -> str:
             lines.append(line)
             continue
         # function / class / interface / type declarations
-        if re.match(r"^(export\s+)?(async\s+)?function\s+", s):
+        if _TS_FUNCTION.match(s):
             lines.append(line)
             continue
-        if re.match(r"^(export\s+)?(default\s+)?class\s+", s):
+        if _TS_CLASS.match(s):
             lines.append(line)
             continue
-        if re.match(r"^(export\s+)?(interface|type|enum)\s+", s):
+        if _TS_TYPE.match(s):
             lines.append(line)
             continue
         # const function expressions
-        if re.match(r"^(export\s+)?(const|let|var)\s+\w+\s*[=:]\s*(async\s+)?\(", s):
+        if _TS_CONST_FN.match(s):
             lines.append(line)
             continue
         # decorators
@@ -121,7 +142,7 @@ def _go_skeleton(src: str) -> str:
         s = line.strip()
         if s.startswith(("package ", "import ", "type ", "const ", "var ")):
             lines.append(line)
-        elif re.match(r"^func\s+", s):
+        elif _GO_FUNC.match(s):
             lines.append(line)
     return "\n".join(lines)
 
@@ -132,7 +153,7 @@ def _java_skeleton(src: str) -> str:
         s = line.strip()
         if s.startswith(("package ", "import ")):
             lines.append(line)
-        elif re.match(r"^(public|private|protected|abstract|static|final|class|interface|enum)", s):
+        elif _JAVA_MEMBER.match(s):
             lines.append(line)
     return "\n".join(lines)
 
@@ -143,9 +164,9 @@ def _rust_skeleton(src: str) -> str:
         s = line.strip()
         if s.startswith(("use ", "mod ", "pub mod ", "extern crate")):
             lines.append(line)
-        elif re.match(r"^(pub\s+)?(async\s+)?fn\s+", s):
+        elif _RUST_FN.match(s):
             lines.append(line)
-        elif re.match(r"^(pub\s+)?(struct|enum|trait|impl|type)\s+", s):
+        elif _RUST_TYPE.match(s):
             lines.append(line)
     return "\n".join(lines)
 
@@ -154,7 +175,7 @@ def _ruby_skeleton(src: str) -> str:
     lines: list[str] = []
     for line in src.splitlines():
         s = line.strip()
-        if re.match(r"^(require|include|module|class|def)\s+", s):
+        if _RUBY_DECL.match(s):
             lines.append(line)
         elif s.startswith("attr_"):
             lines.append(line)
@@ -170,4 +191,6 @@ def _generic_skeleton(src: str) -> str:
 
 
 def _est(t: str) -> int:
-    return max(1, len(t) // 4)
+    from TrimP.tokenization import count_tokens
+
+    return count_tokens(t).tokens

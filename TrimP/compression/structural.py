@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+_STALE_MARKERS = re.compile(r"(?i)(TODO:|FIXME:|OUTDATED:|OLD:)")
+_FILLER_PHRASES = re.compile(r"(?i)\b(please note|it is important to|make sure to)\b")
+_NEGATIVE_INSTRUCTIONS = re.compile(r"(?i)\bdo not\b|\bnever\b|\bavoid\b")
+
 
 @dataclass
 class SourceAudit:
@@ -69,7 +73,7 @@ class StructuralAuditor:
             score -= 0.3
 
         # Look for stale/redundant sections
-        stale_markers = re.findall(r"(?i)(TODO:|FIXME:|OUTDATED:|OLD:)", content)
+        stale_markers = _STALE_MARKERS.findall(content)
         if stale_markers:
             issues.append(f"{len(stale_markers)} stale markers found")
             score -= 0.1
@@ -81,7 +85,7 @@ class StructuralAuditor:
             score -= 0.1
 
         # Verbose filler
-        filler = re.findall(r"(?i)\b(please note|it is important to|make sure to)\b", content)
+        filler = _FILLER_PHRASES.findall(content)
         if len(filler) > 3:
             issues.append(f"{len(filler)} verbose filler phrases")
             score -= 0.05 * len(filler)
@@ -125,7 +129,7 @@ class StructuralAuditor:
         if len(content) > 8_000:
             issues.append("copilot-instructions.md is large — every turn pays this cost")
             score -= 0.25
-        neg_instructions = re.findall(r"(?i)\bdo not\b|\bnever\b|\bavoid\b", content)
+        neg_instructions = _NEGATIVE_INSTRUCTIONS.findall(content)
         if len(neg_instructions) > 15:
             issues.append(f"{len(neg_instructions)} negative instructions — consider consolidating")
             score -= 0.1
@@ -133,7 +137,9 @@ class StructuralAuditor:
 
 
 def _make_audit(name: str, path: str, content: str, score: float, issues: list[str]) -> SourceAudit:
-    token_est = max(1, len(content) // 4)
+    from TrimP.tokenization import count_tokens
+
+    token_est = count_tokens(content).tokens
     grade = _grade(score)
     return SourceAudit(
         name=name, path=path, char_count=len(content),

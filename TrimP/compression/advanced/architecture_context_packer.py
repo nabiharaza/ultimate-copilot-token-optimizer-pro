@@ -13,6 +13,12 @@ Based on: Software architecture visualization best practices.
 import re
 from typing import List, Dict, Set, Tuple
 
+_COMPONENT_NAME_PATTERN = re.compile(
+    r'\b([A-Z][a-zA-Z]*(?:Service|Controller|Manager|Handler|Repository|Module|Component|API|Gateway))\b'
+)
+_QUOTED_SERVICE_PATTERN = re.compile(r'"([A-Za-z\-_]+(?:service|api|module))"', re.IGNORECASE)
+_CODE_IDENTIFIER_PATTERN = re.compile(r'`([A-Za-z]+(?:Service|Controller|Manager|Handler))`')
+
 
 class ArchitectureContextPacker:
     """Compress architecture documents to structured graphs."""
@@ -58,19 +64,19 @@ class ArchitectureContextPacker:
     def _extract_components(self, text: str) -> Set[str]:
         """Extract component/service names."""
         components = set()
-        
+
         # Pattern 1: Service/Component names (capitalized or CamelCase)
-        for match in re.finditer(r'\b([A-Z][a-zA-Z]*(?:Service|Controller|Manager|Handler|Repository|Module|Component|API|Gateway))\b', text):
+        for match in _COMPONENT_NAME_PATTERN.finditer(text):
             components.add(match.group(1))
-        
+
         # Pattern 2: Quoted service names
-        for match in re.finditer(r'"([A-Za-z\-_]+(?:service|api|module))"', text, re.IGNORECASE):
+        for match in _QUOTED_SERVICE_PATTERN.finditer(text):
             components.add(match.group(1))
-        
+
         # Pattern 3: Code identifiers
-        for match in re.finditer(r'`([A-Za-z]+(?:Service|Controller|Manager|Handler))`', text):
+        for match in _CODE_IDENTIFIER_PATTERN.finditer(text):
             components.add(match.group(1))
-        
+
         return components
     
     def _extract_relationships(self, text: str, components: Set[str]) -> List[Tuple[str, str, str]]:

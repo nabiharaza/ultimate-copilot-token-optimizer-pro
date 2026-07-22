@@ -308,9 +308,11 @@ def compress(
     # Get or create session for logging
     session_id = get_or_create_session()
     
-    # Count tokens (rough estimate: 4 chars per token)
+    # Count through the shared tokenizer service.
     def estimate_tokens(t: str) -> int:
-        return max(1, len(t) // 4)
+        from TrimP.tokenization import count_tokens
+
+        return count_tokens(t).tokens
     
     tokens_before = estimate_tokens(text)
     
@@ -627,16 +629,20 @@ app.add_typer(intellij_app, name="intellij")
 
 @intellij_app.command("proxy")
 def intellij_proxy(
-    port: int = typer.Option(8765, "--port", "-p", help="Proxy port"),
+    port: int = typer.Option(8767, "--port", "-p", help="Proxy port"),
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Proxy host"),
     integration_id: str = typer.Option("intellij-chat", "--integration-id", help="Copilot integration ID"),
 ):
     """[bold]🔌 Start IntelliJ/PyCharm Copilot Chat compression proxy.[/bold]
 
     1. Run this command
-    2. In PyCharm: Settings -> HTTP Proxy -> Manual -> localhost:8765
+    2. In PyCharm: Settings -> HTTP Proxy -> Manual -> localhost:8767
     3. Restart PyCharm
     4. Use Copilot Chat normally - context is auto-compressed!
+
+    Port must match `trimp intellij configure` / `trimp vscode configure`
+    (both default to 8767) — a mismatch here means nothing actually routes
+    through this proxy even though the IDE thinks it's configured.
     """
     console.print(f"[bold cyan]🔧 TrimP IntelliJ Proxy[/bold cyan]")
     console.print(f"   Listening: [bold]http://{host}:{port}[/bold]")
@@ -644,7 +650,7 @@ def intellij_proxy(
     console.print()
     console.print("[yellow]Configure PyCharm/IntelliJ:[/yellow]")
     console.print("  Settings → Appearance & Behavior → System Settings → HTTP Proxy")
-    console.print("  Manual proxy configuration: HTTP, Host: localhost, Port: 8765")
+    console.print(f"  Manual proxy configuration: HTTP, Host: localhost, Port: {port}")
     console.print("  ✅ Use this proxy server for all protocols")
     console.print()
     console.print("[yellow]Or via environment (launch PyCharm from same terminal):[/yellow]")
@@ -671,24 +677,30 @@ def intellij_config():
     console.print("  2. Open PyCharm Settings (⌘, / Ctrl+Alt+S)")
     console.print("  3. Go to: Appearance & Behavior → System Settings → HTTP Proxy")
     console.print("  4. Select: Manual proxy configuration")
-    console.print("  5. HTTP: Host=localhost, Port=8765")
+    console.print("  5. HTTP: Host=localhost, Port=8767")
     console.print("  6. ✅ Check: 'Use this proxy server for all protocols'")
     console.print("  7. Apply → OK → Restart PyCharm")
     console.print()
     console.print("[bold cyan]Method 2: Environment Variables[/bold cyan]")
-    console.print("  export HTTP_PROXY=http://localhost:8765")
-    console.print("  export HTTPS_PROXY=http://localhost:8765")
+    console.print("  export HTTP_PROXY=http://localhost:8767")
+    console.print("  export HTTPS_PROXY=http://localhost:8767")
     console.print("  pycharm  # Launch from this terminal")
     console.print()
     console.print("[bold cyan]Method 3: Proxy Auto-Config (PAC)[/bold cyan]")
     console.print("  Create proxy.pac:")
     console.print('    function FindProxyForURL(url, host) {')
-    console.print('      if (shExpMatch(host, "*githubcopilot.com*")) return "PROXY localhost:8765";')
+    console.print('      if (shExpMatch(host, "*githubcopilot.com*")) return "PROXY localhost:8767";')
     console.print('      return "DIRECT";')
     console.print('    }')
     console.print("  In PyCharm: HTTP Proxy → Automatic proxy configuration URL → file:///path/proxy.pac")
     console.print()
-    console.print("[bold]Verify:[/bold] curl http://localhost:8765/health")
+    console.print("[bold]Verify:[/bold] trimp intellij probe --editor pycharm")
+    console.print("[dim](There is no plain HTTP /health endpoint on this proxy — it only")
+    console.print(" answers the special trimp.local probe host, which `intellij probe` sends.)[/dim]")
+    console.print()
+    console.print("[bold]JetBrains only:[/bold] if the IDE reports a TLS/certificate error, run")
+    console.print("  [bold]trimp intellij trust-ca[/bold]  (macOS) to trust the local proxy's CA.")
+    console.print("  VS Code doesn't need this — `vscode configure` disables strict TLS instead.")
 
 
 @intellij_app.command("configure")
@@ -700,6 +712,38 @@ def intellij_configure(
     from TrimP.intellij_proxy import configure_ide
     result = configure_ide(port=port, config_path=config_path or None)
     console.print_json(json.dumps(result))
+    console.print()
+    console.print(
+        "[yellow]Next:[/yellow] unlike VS Code, PyCharm/Rider don't have a "
+        "'skip TLS verification' setting, so the proxy's CA cert must be "
+        "trusted or Copilot traffic will fail to connect through it."
+    )
+    console.print("  Run: [bold]trimp intellij trust-ca[/bold]  (macOS only)")
+
+
+@intellij_app.command("trust-ca")
+def intellij_trust_ca():
+    """Trust the local proxy's CA certificate (macOS only, required for PyCharm/Rider).
+
+    VS Code doesn't need this — `vscode configure` sets proxyStrictSSL=false
+    instead, which sidesteps certificate trust entirely. JetBrains IDEs have
+    no equivalent setting, so without a trusted CA, the mitmproxy bridge can
+    accept the connection but the IDE's own TLS validation will still reject
+    it — traffic looks "configured" but silently never actually completes.
+    """
+    from TrimP.intellij_proxy import ca_is_trusted, trust_ca
+    if ca_is_trusted():
+        console.print("[green]✓ CA certificate already trusted[/green]")
+        return
+    try:
+        result = trust_ca()
+        console.print_json(json.dumps(result))
+        if result.get("trusted"):
+            console.print("[green]✓ CA certificate trusted — restart PyCharm/Rider to pick it up[/green]")
+        else:
+            console.print("[red]✗ Could not trust the CA certificate — see message above[/red]")
+    except RuntimeError as e:
+        console.print(f"[red]✗ {e}[/red]")
 
 
 vscode_app = typer.Typer(help="VS Code Copilot Chat proxy integration.")
@@ -722,19 +766,26 @@ def vscode_unconfigure():
 
 @intellij_app.command("test")
 def intellij_test(
-    port: int = typer.Option(8765, "--port", "-p"),
+    port: int = typer.Option(8767, "--port", "-p"),
+    editor: str = typer.Option("pycharm", "--editor", "-e", help="pycharm | rider | vscode"),
 ):
-    """Test if IntelliJ proxy is running and compressing."""
-    import requests
+    """Test if the IntelliJ/VS Code proxy is running and reachable.
+
+    Alias for `trimp intellij probe` with friendlier pass/fail output. This
+    used to GET a plain http://.../health endpoint, which the mitmproxy
+    bridge never actually implements (it only answers the special
+    trimp.local probe host) — that check always reported "not reachable"
+    even when the proxy was working. Uses the real probe mechanism now.
+    """
+    from TrimP.intellij_proxy import probe_proxy
     try:
-        r = requests.get(f"http://localhost:{port}/health", timeout=2)
-        if r.status_code == 200:
-            data = r.json()
-            console.print(f"[green]✓ Proxy running[/green] (session: {data.get('session_id', '?')})")
-            console.print(f"  Requests: {data.get('requests_processed', 0)}")
-            console.print(f"  Tokens saved: {data.get('total_tokens_saved', 0):,}")
+        result = probe_proxy(editor=editor, port=port)
+        if result.get("intercepted"):
+            console.print(f"[green]✓ Proxy reachable and intercepting[/green] (editor: {editor}, port: {port})")
         else:
-            console.print(f"[red]Proxy returned {r.status_code}[/red]")
+            console.print(f"[red]✗ Proxy did not intercept the probe[/red] (editor: {editor}, port: {port})")
+            console.print(f"  {result}")
+            console.print("Start with: [bold]TrimP intellij proxy[/bold] (same --port)")
     except Exception as e:
         console.print(f"[red]✗ Proxy not reachable: {e}[/red]")
         console.print("Start with: [bold]TrimP intellij proxy[/bold]")

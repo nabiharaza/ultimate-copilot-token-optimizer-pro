@@ -75,7 +75,9 @@ def _lines(content: str) -> int:
 
 
 def _est(t: str) -> int:
-    return max(1, len(t) // 4)
+    from TrimP.tokenization import count_tokens
+
+    return count_tokens(t).tokens
 
 
 def _unified_diff(old: str, new: str, fname: str) -> str:

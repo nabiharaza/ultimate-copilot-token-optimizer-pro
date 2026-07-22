@@ -12,13 +12,35 @@ Example:
 """
 
 from typing import Dict, Any, Tuple
+from TrimP.compression.advanced.llmlingua2 import LLMLingua2Compressor
 from TrimP.compression.advanced.universal_optimizer import UniversalOptimizer
+from TrimP.tokenization import count_tokens
 
-# Global instance with aggressive mode enabled by default
-_optimizer = UniversalOptimizer(aggressive=True)
+# Balanced and verification-friendly by default. Aggressive compression is a
+# per-policy choice, not a process-global hidden default.
+_shared_learned = LLMLingua2Compressor()
+_optimizers = {
+    'conservative': UniversalOptimizer(aggressive=False),
+    'balanced': UniversalOptimizer(aggressive=False),
+    'aggressive': UniversalOptimizer(aggressive=True),
+}
+for _optimizer in _optimizers.values():
+    _optimizer.learned = _shared_learned
 
 
-def compress_text(text: str, hint: str = None) -> Dict[str, Any]:
+def warm_learned_compressor() -> None:
+    """Begin loading the shared learned model for long-lived proxy workers."""
+    _shared_learned.warm_async()
+
+
+def compress_text(
+    text: str,
+    hint: str = None,
+    *,
+    query: str = "",
+    model: str | None = None,
+    policy: str = "balanced",
+) -> Dict[str, Any]:
     """
     Compress any text using the best algorithm automatically.
     
@@ -47,11 +69,15 @@ def compress_text(text: str, hint: str = None) -> Dict[str, Any]:
         Saved 57.6%
     """
     # Compress
-    compressed, metadata = _optimizer.compress(text, hint=hint)
+    selected_policy = str(policy or "balanced").lower()
+    optimizer = _optimizers.get(selected_policy, _optimizers['balanced'])
+    compressed, metadata = optimizer.compress(text, hint=hint, query=query, model=model)
+    metadata['policy'] = selected_policy if selected_policy in _optimizers else 'balanced'
     
-    # Calculate tokens (rough estimate: 1 token ≈ 4 chars)
-    original_tokens = len(text) // 4
-    compressed_tokens = len(compressed) // 4
+    original_count = count_tokens(text, model=model)
+    compressed_count = count_tokens(compressed, model=model)
+    original_tokens = original_count.tokens
+    compressed_tokens = compressed_count.tokens
     tokens_saved = original_tokens - compressed_tokens
     
     # Build result
@@ -66,6 +92,8 @@ def compress_text(text: str, hint: str = None) -> Dict[str, Any]:
         'savings_pct': metadata.get('savings_pct', 0.0),
         'method': metadata.get('method', 'Unknown'),
         'routed_to': metadata.get('routed_to', None),
+        'tokenizer': original_count.tokenizer,
+        'token_count_exact': original_count.exact_for_serialized_input,
         'metadata': metadata
     }
 
@@ -84,7 +112,7 @@ def compress_simple(text: str) -> str:
         >>> compressed = compress_simple("Very long text...")
         >>> print(compressed)
     """
-    compressed, _ = _optimizer.compress(text)
+    compressed, _ = _optimizers['balanced'].compress(text)
     return compressed
 
 

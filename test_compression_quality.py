@@ -64,7 +64,7 @@ User: Can you show me the terraform code?
 Assistant: Sure, here's an example terraform configuration...
 '''
 
-def test_compressor(name, compressor, sample):
+def run_compressor_case(name, compressor, sample):
     """Test a single compressor"""
     print(f"\n{'='*60}")
     print(f"Testing: {name}")
@@ -110,42 +110,42 @@ def main():
     results = {}
     
     # Test Code Compression
-    results['code'] = test_compressor(
+    results['code'] = run_compressor_case(
         "Code Compression",
         CodeContextTrimmer(),
         CODE_SAMPLE
     )
     
     # Test JSON Compression
-    results['json'] = test_compressor(
+    results['json'] = run_compressor_case(
         "JSON Compression",
         JSONMinimizer(),
         JSON_SAMPLE
     )
     
     # Test Log Compression
-    results['log'] = test_compressor(
+    results['log'] = run_compressor_case(
         "Log Compression",
         LogExtractor(),
         LOG_SAMPLE
     )
     
     # Test Conversation Compression
-    results['conversation'] = test_compressor(
+    results['conversation'] = run_compressor_case(
         "Conversation Compression",
         ConversationCompressor(),
         CONVERSATION_SAMPLE
     )
     
     # Test Universal (should route to appropriate compressor)
-    results['universal'] = test_compressor(
+    results['universal'] = run_compressor_case(
         "Universal Optimizer",
         UniversalOptimizer(),
         CODE_SAMPLE
     )
     
     # Test Lingua Lite
-    results['lingua'] = test_compressor(
+    results['lingua'] = run_compressor_case(
         "LLMLingua Lite",
         LLMLinguaLite(),
         "This is a very long piece of text with lots of words that could be compressed by removing low-information tokens and keeping only the most important content for understanding."

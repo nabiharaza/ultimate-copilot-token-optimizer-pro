@@ -20,19 +20,21 @@ from .json_minimizer import compress_json
 from .log_extractor import compress_log
 from .semantic_chunker import compress_semantic
 from .llm_lingua_lite import compress_llm_lingua
+from .llmlingua2 import LLMLingua2Compressor
 
 
 class UniversalOptimizer:
     """Route input to the best compression algorithm."""
     
-    def __init__(self, aggressive: bool = True):
+    def __init__(self, aggressive: bool = False):
         """
         Args:
             aggressive: Use more aggressive compression settings (default: True for maximum savings)
         """
         self.aggressive = aggressive
+        self.learned = LLMLingua2Compressor()
     
-    def compress(self, text: str, hint: str = None) -> Tuple[str, dict]:
+    def compress(self, text: str, hint: str = None, *, query: str = "", model: str | None = None) -> Tuple[str, dict]:
         """
         Compress text using the best algorithm for its type.
         
@@ -45,11 +47,11 @@ class UniversalOptimizer:
         """
         if hint:
             # Use hint
-            compressed, metadata = self._compress_with_hint(text, hint)
+            compressed, metadata = self._compress_with_hint(text, hint, query=query, model=model)
         else:
             # Auto-detect
             input_type = self._detect_type(text)
-            compressed, metadata = self._compress_by_type(text, input_type)
+            compressed, metadata = self._compress_by_type(text, input_type, query=query, model=model)
         
         # Ensure UniversalOptimizer is in metadata
         if 'method' not in metadata or metadata['method'] != 'UniversalOptimizer':
@@ -85,7 +87,7 @@ class UniversalOptimizer:
         # Default: generic document
         return 'doc'
     
-    def _compress_with_hint(self, text: str, hint: str) -> Tuple[str, dict]:
+    def _compress_with_hint(self, text: str, hint: str, *, query: str = "", model: str | None = None) -> Tuple[str, dict]:
         """Compress using hint."""
         hint = hint.lower()
         
@@ -101,12 +103,12 @@ class UniversalOptimizer:
             # Can't compress without structure
             return text, {'method': 'UniversalOptimizer', 'error': 'Chat needs structured input', 'savings_pct': 0}
         elif hint == 'doc':
-            ratio = 0.4 if self.aggressive else 0.5
-            return compress_llm_lingua(text, target_ratio=ratio)
+            ratio = 0.4 if self.aggressive else 0.55
+            return self.learned.compress(text, query=query, target_ratio=ratio, model=model)
         else:
             return text, {'method': 'UniversalOptimizer', 'error': f'Unknown hint: {hint}', 'savings_pct': 0}
     
-    def _compress_by_type(self, text: str, input_type: str) -> Tuple[str, dict]:
+    def _compress_by_type(self, text: str, input_type: str, *, query: str = "", model: str | None = None) -> Tuple[str, dict]:
         """Compress based on detected type."""
         try:
             if input_type == 'code':
@@ -118,18 +120,19 @@ class UniversalOptimizer:
                 ratio = 0.2 if self.aggressive else 0.3
                 return compress_log(text, target_ratio=ratio)
             elif input_type == 'chat':
-                # Can't detect structure, use generic
-                ratio = 0.4 if self.aggressive else 0.5
-                return compress_llm_lingua(text, target_ratio=ratio)
+                ratio = 0.4 if self.aggressive else 0.55
+                return self.learned.compress(text, query=query, target_ratio=ratio, model=model)
             else:  # doc
-                ratio = 0.4 if self.aggressive else 0.5
-                return compress_llm_lingua(text, target_ratio=ratio)
+                ratio = 0.4 if self.aggressive else 0.55
+                return self.learned.compress(text, query=query, target_ratio=ratio, model=model)
         except Exception as e:
-            # Fallback: generic compression
-            return compress_llm_lingua(text, target_ratio=0.5)
+            # Fail safely to complete-sentence extraction, never word pruning.
+            compressed, metadata = compress_llm_lingua(text, target_ratio=0.65, query=query)
+            metadata['fallback_reason'] = f'{type(e).__name__}: {e}'
+            return compressed, metadata
 
 
-def compress_universal(text: str, hint: str = None, aggressive: bool = False) -> Tuple[str, dict]:
+def compress_universal(text: str, hint: str = None, aggressive: bool = False, query: str = "", model: str | None = None) -> Tuple[str, dict]:
     """
     Convenience function for universal optimization.
     
@@ -142,4 +145,4 @@ def compress_universal(text: str, hint: str = None, aggressive: bool = False) ->
         (compressed_text, metadata)
     """
     optimizer = UniversalOptimizer(aggressive=aggressive)
-    return optimizer.compress(text, hint=hint)
+    return optimizer.compress(text, hint=hint, query=query, model=model)

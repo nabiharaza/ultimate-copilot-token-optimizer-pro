@@ -8,11 +8,11 @@ from __future__ import annotations
 from datetime import datetime
 
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+from textual.containers import Horizontal, ScrollableContainer
 from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import (
-    DataTable, Footer, Header, Label, ProgressBar, Rule, Static, TabbedContent, TabPane,
+    DataTable, Footer, Header, Label, Static, TabbedContent, TabPane,
 )
 
 from TrimP.db import db

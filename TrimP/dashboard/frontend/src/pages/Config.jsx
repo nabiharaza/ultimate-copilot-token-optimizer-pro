@@ -2,12 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Activity, Archive, ArchiveRestore, Braces, Check, CheckCircle2, ChevronDown, CircleHelp,
   Clock3, Code2, Database, Download, ExternalLink, FileArchive, FileCode2, FileJson,
-  Gauge, GitBranch, Globe2, HardDrive, Info, LockKeyhole, RefreshCw, Save, Search,
+  Gauge, GitBranch, Globe2, HardDrive, Info, LockKeyhole, Palette, RefreshCw, Save, Search,
   Server, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Tag, Terminal, Trash2,
   WalletCards, X, XCircle, Zap,
 } from 'lucide-react'
 import { useApi, useRefreshTick } from '../hooks/useApi.js'
 import { Loading } from '../components/Charts.jsx'
+import { FONT_SIZES, PALETTES } from '../theme.js'
 
 const FEATURE_META = {
   'compression.bash.enabled': ['Bash/script content', 'Terminal output', 'Compresses command output while preserving errors and exit context.', Terminal],
@@ -48,7 +49,7 @@ function shortTime(value) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-export default function Config({ onNavigate }) {
+export default function Config({ onNavigate, palette, savedPalette, isPreviewing, onPreviewTheme, onSaveTheme, onCancelPreview, fontSize, onSetFontSize }) {
   const { data: config, loading, refetch } = useApi('/api/config')
   const [saving, setSaving] = useState(null)
   const [editValues, setEditValues] = useState({})
@@ -204,6 +205,56 @@ export default function Config({ onNavigate }) {
           <div className="settings-retention-controls"><select id="retention-months" value={retentionValue} onChange={event => update('logs.retention_months', event.target.value)}><option value="1">1 month</option><option value="3">3 months</option><option value="6">6 months (recommended)</option><option value="12">12 months</option><option value="24">24 months</option><option value="0">Forever</option></select><button className="retention-save" onClick={() => save('logs.retention_months', retentionValue)} disabled={saving === 'logs.retention_months'}><Save size={14} /> Save period</button></div>
           {saveMessage && <span className="settings-save-message">{saveMessage}</span>}
         </article>
+      </section>
+
+      <section className="settings-appearance settings-card">
+        <div className="settings-section-heading"><div><h2><Palette size={16} /> Appearance</h2><p>Seven themes modeled on real editors — GitHub, VS Code, IntelliJ, Solarized, and PyCharm Darcula. Click one to preview it across the whole app, then save it or cancel.</p></div></div>
+        {isPreviewing && (
+          <div className="settings-preview-bar">
+            <span>Previewing <b>{PALETTES.find(item => item.id === palette)?.label}</b> — this isn't saved yet.</span>
+            <div>
+              <button type="button" className="settings-preview-cancel" onClick={onCancelPreview}>Cancel</button>
+              <button type="button" className="settings-preview-save" onClick={onSaveTheme}><Save size={13} /> Save theme</button>
+            </div>
+          </div>
+        )}
+        <div className="settings-palette-grid">
+          {['dark', 'light'].map(family => (
+            <div className="settings-palette-group" key={family}>
+              <small className="settings-palette-group-label">{family === 'dark' ? 'Dark' : 'Light'}</small>
+              <div className="settings-palette-options">
+                {PALETTES.filter(item => item.family === family).map(item => (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className={`settings-palette-option ${palette === item.id ? 'active' : ''} ${savedPalette === item.id ? 'is-saved' : ''}`}
+                    onClick={() => onPreviewTheme?.(item.id)}
+                    title={item.note}
+                  >
+                    <span className="settings-palette-swatch">{item.swatch.map((color, index) => <i key={index} style={{ background: color }} />)}</span>
+                    <span className="settings-palette-name">{item.label}</span>
+                    {savedPalette === item.id && !isPreviewing && <Check size={13} className="settings-palette-check" />}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="settings-font-size-row">
+          <div><b>UI size</b><small>Scales fonts, icons, and spacing together across the whole app.</small></div>
+          <div className="settings-font-size-options" role="group" aria-label="UI size">
+            {FONT_SIZES.map(item => (
+              <button
+                type="button"
+                key={item.id}
+                className={`settings-font-size-option ${fontSize === item.id ? 'active' : ''}`}
+                onClick={() => onSetFontSize?.(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
       </section>
 
       <section className="settings-danger-zone settings-card"><div><div className="settings-danger-title"><Trash2 size={17} /> Telemetry database</div><p>Remove captured conversations, traces, quality scores, and savings history. Configuration is preserved.</p></div><button className="danger-button" onClick={() => setClearOpen(true)}><Trash2 size={15} /> Clear DB</button></section>

@@ -290,7 +290,9 @@ class CompressionProxy:
             )
 
     def _estimate_tokens(self, text: str) -> int:
-        return max(1, len(str(text)) // 4)
+        from TrimP.tokenization import count_tokens
+
+        return count_tokens(str(text)).tokens
 
     def _response_headers(self, upstream_headers: Any, stats) -> dict[str, str]:
         headers = dict(upstream_headers)

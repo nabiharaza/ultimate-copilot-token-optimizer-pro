@@ -679,6 +679,9 @@ async def list_models():
             {"id": "gpt-5.4", "object": "model"},
             {"id": "gpt-5.4-mini", "object": "model"},
             {"id": "gpt-5.5", "object": "model"},
+            {"id": "gpt-5.6-sol", "object": "model"},
+            {"id": "gpt-5.6-terra", "object": "model"},
+            {"id": "gpt-5.6-luna", "object": "model"},
             {"id": "gemini-3.1-pro", "object": "model"},
             {"id": "gemini-3.5-flash", "object": "model"},
         ]

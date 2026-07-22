@@ -190,13 +190,20 @@ The active navigation is intentionally small and evidence-oriented:
 - **Overview:** current requests, estimated before/after/saved tokens, estimated cost saved, model mix, request-volume chart, and recent activity.
 - **Repositories:** repository-level requests, before volume, saved tokens, reduction, model, IDE, and local-time attribution.
 - **Trim policy:** repository scope, conservative/balanced/aggressive policy, per-algorithm switches, and estimated impact.
-- **Connections:** configured proxy and IDE bridge endpoints.
+- **Developer docs:** interactive developer, user, architecture, and release guides with a live policy-aware compression laboratory.
 - **Conversations:** searchable session groups with prompt, repository, IDE, model, exact Agent Debug Log usage when available, context details, and cost estimates.
 - **Live activity:** request-level events and an idle flatline when TrimPy is off or no traffic is arriving.
 - **A/B preflight:** local reproducible baseline versus optimized request-body evidence.
 - **Validation:** quick, standard, and full local certification runs with scenario-level audit evidence.
 - **Diff review:** before/after context changes, algorithm attribution, restore, and approval workflow.
 - **Alerts, Help & feedback, Settings:** operational recovery, documentation, feedback, health, retention, database controls, pricing, and compression configuration.
+
+## Documentation
+
+- [Developer Guide](docs/DEVELOPER_GUIDE.md) — compiler lifecycle, compression algorithms, verification gates, APIs, extension points, and testing.
+- [User Guide](docs/USER_GUIDE.md) — installation, editor setup, daily operation, policies, diff review, manager demonstrations, and troubleshooting.
+- [Architecture Guide](docs/ARCHITECTURE_GUIDE.md) — system topology, request sequence, trust boundaries, failure behavior, observability, and deployment.
+- [Changelog](CHANGELOG.md) — released and unreleased product, safety, algorithm, dashboard, and operational changes.
 
 ## IDE setup and verification
 
@@ -210,6 +217,24 @@ trimp intellij configure
 Use a fresh chat in a known repository and keep the model fixed. In **Conversations**, filter by the IDE and repository, then compare a TrimPy-off request with the same prompt sent with TrimPy on. The evidence row should preserve the prompt fingerprint, timestamps, repository, IDE, model label, proxy before/after estimate, actual input/output/cached tokens from the Agent Debug Logs when present, and the model-specific API-equivalent cost estimate. Restart Rider/PyCharm/IntelliJ after changing proxy configuration; no absolute project path is required.
 
 For a management proof, use the same fixed prompt across five contexts: long conversation, repeated tool output, code context, multiple files, and a short request. Show the matched off/on pair, then open its trace details. The local A/B and Validation pages measure deterministic request shaping; the IDE pair demonstrates real traffic. Neither should be presented as an invoice claim for GitHub Enterprise quota unless the upstream source exposes that exact field.
+
+## Claude Code setup
+
+TrimPy also ships a local MCP server (`.mcp.json` → `trimpy`) exposing
+compressed-output tool variants — `TrimP_bash`, `TrimP_read_file`,
+`TrimP_grep`, `TrimP_compress`, `TrimP_stats` — that shrink large tool
+output *before* it enters Claude's context, not just after the fact.
+`CLAUDE.md` at the repo root tells Claude Code when to prefer these over
+the native Bash/Read/Grep tools.
+
+Install the optional `mcp` extra so the server can actually start:
+
+```bash
+pip install -e ".[mcp]"
+```
+
+If it doesn't come up, check `~/.trimp/mcp_server.log` — `TrimP_mcp_wrapper.sh`
+logs startup failures there (e.g. missing `fastmcp`) instead of discarding them.
 
 ## Development and QA
 

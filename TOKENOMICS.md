@@ -7,7 +7,7 @@ We use the **4-char-per-token rule**, which matches real-world LLM tokenization:
 
 ```python
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    return count_tokens(text, model=model).tokens
 ```
 
 **Why 4 chars/token?**

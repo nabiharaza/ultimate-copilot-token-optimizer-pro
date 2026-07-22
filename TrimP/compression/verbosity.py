@@ -127,4 +127,6 @@ class VerbosityReport:
 
 
 def _est(t: str) -> int:
-    return max(1, len(t) // 4)
+    from TrimP.tokenization import count_tokens
+
+    return count_tokens(t).tokens

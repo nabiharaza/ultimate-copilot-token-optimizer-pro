@@ -162,8 +162,9 @@ class BashCompressor:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token."""
-    return max(1, len(text) // 4)
+    from TrimP.tokenization import count_tokens
+
+    return count_tokens(text).tokens
 
 
 def _redact_secrets(text: str) -> str:
@@ -244,4 +245,3 @@ def _compress_with_best_algo(text: str) -> tuple[bytes | None, str]:
         pass
 
     return best_data, best_algo
-

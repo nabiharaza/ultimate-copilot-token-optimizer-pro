@@ -1,5 +1,6 @@
-import { Bell, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FileText, FlaskConical, Gauge, GitBranch, MessageSquare, Moon, Settings, ShieldCheck, SlidersHorizontal, Sun } from 'lucide-react'
+import { Bell, BookOpen, Check, ChevronLeft, ChevronRight, CircleHelp, FileDiff, FlaskConical, Gauge, GitBranch, MessageSquare, Moon, Settings, ShieldCheck, SlidersHorizontal, Sun } from 'lucide-react'
 import { useState } from 'react'
+import { PALETTES } from '../theme.js'
 
 const SIDEBAR_ITEMS = [
   { section: 'Overview' },
@@ -7,7 +8,7 @@ const SIDEBAR_ITEMS = [
   { section: 'Data' },
   { id: 'activity', icon: GitBranch, label: 'Repositories' },
   { id: 'policy', icon: SlidersHorizontal, label: 'Trim policy' },
-  { id: 'system', icon: FileText, label: 'Connections' },
+  { id: 'system', icon: BookOpen, label: 'Developer docs' },
   { section: 'Insights' },
   { id: 'sessions', icon: MessageSquare, label: 'Conversations' },
   { id: 'demo', icon: FlaskConical, label: 'A/B preflight' },
@@ -19,9 +20,10 @@ const SIDEBAR_ITEMS = [
   { id: 'settings', icon: Settings, label: 'Settings' },
 ]
 
-export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkMode, onToggleDarkMode, optimizerEnabled = true }) {
+export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkMode, onToggleDarkMode, palette, savedPalette, isPreviewing, onPreviewTheme, onSaveTheme, onCancelPreview, optimizerEnabled = true }) {
   const [brandClicks, setBrandClicks] = useState(0)
   const [secretOpen, setSecretOpen] = useState(false)
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false)
 
   function activateBrand() {
     onNavigate('home')
@@ -56,7 +58,55 @@ export default function Sidebar({ active, onNavigate, collapsed, onToggle, darkM
       </nav>
       {secretOpen && <div className="sidebar-secret" role="status"><b>TrimPy unlocked</b><span>Cut the noise. Keep the signal.</span></div>}
       <div className="sidebar-footer">
-        <button className="theme-toggle" onClick={onToggleDarkMode} aria-label={darkMode ? 'Use light mode' : 'Use dark mode'} title={darkMode ? 'Use light mode' : 'Use dark mode'}><span className="theme-toggle-icon">{darkMode ? <Sun size={17} /> : <Moon size={17} />}</span><span>{darkMode ? 'Light mode' : 'Dark mode'}</span></button>
+        <div className="theme-picker">
+          {themeMenuOpen && (
+            <button
+              className="theme-picker-backdrop"
+              aria-label="Close theme picker"
+              onClick={() => { onCancelPreview?.(); setThemeMenuOpen(false) }}
+            />
+          )}
+          <button className="theme-toggle" onClick={() => setThemeMenuOpen(value => !value)} aria-label="Choose theme" title="Choose theme" aria-expanded={themeMenuOpen}>
+            <span className="theme-toggle-icon">{darkMode ? <Moon size={17} /> : <Sun size={17} />}</span>
+            <span>{PALETTES.find(item => item.id === palette)?.label || (darkMode ? 'Dark' : 'Light')}</span>
+          </button>
+          {themeMenuOpen && (
+            <div className="theme-picker-menu" role="menu">
+              {isPreviewing && (
+                <div className="theme-picker-preview-bar">
+                  <span>Previewing <b>{PALETTES.find(item => item.id === palette)?.label}</b></span>
+                  <div>
+                    <button type="button" className="theme-picker-cancel" onClick={onCancelPreview}>Cancel</button>
+                    <button type="button" className="theme-picker-save" onClick={() => { onSaveTheme?.(); setThemeMenuOpen(false) }}>Save</button>
+                  </div>
+                </div>
+              )}
+              <button className="theme-picker-quick-switch" onClick={() => { onToggleDarkMode?.(); setThemeMenuOpen(false) }}>
+                {darkMode ? <Sun size={14} /> : <Moon size={14} />}
+                <span>Switch to {darkMode ? 'light' : 'dark'}</span>
+              </button>
+              {['dark', 'light'].map(family => (
+                <div className="theme-picker-group" key={family}>
+                  <small>{family === 'dark' ? 'Dark' : 'Light'}</small>
+                  <div className="theme-picker-options">
+                    {PALETTES.filter(item => item.family === family).map(item => (
+                      <button
+                        key={item.id}
+                        className={`theme-picker-option ${palette === item.id ? 'active' : ''} ${savedPalette === item.id ? 'is-saved' : ''}`}
+                        onClick={() => onPreviewTheme?.(item.id)}
+                        title={item.note}
+                      >
+                        <span className="theme-picker-swatch">{item.swatch.map((color, index) => <i key={index} style={{ background: color }} />)}</span>
+                        <span>{item.label}</span>
+                        {palette === item.id && <Check size={12} />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </aside>
   )

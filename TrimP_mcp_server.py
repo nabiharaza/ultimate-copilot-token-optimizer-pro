@@ -90,24 +90,36 @@ mcp = FastMCP(
 
 
 def _log_to_db(method: str, original_chars: int, compressed_chars: int, savings_pct: float):
-    """Log compression event to TrimP SQLite database."""
+    """Log compression event to TrimP SQLite database.
+
+    Must match the canonical `compressions` schema from TrimP/db.py
+    (session_id, compressor, tokens_before, tokens_after, compressed_at,
+    source) — not an ad-hoc column set. The dashboard/CLI almost always
+    create that schema before this ever runs, so a mismatched local
+    `CREATE TABLE IF NOT EXISTS` is a no-op and the INSERT below would
+    previously fail on "no such column", silently swallowed by the except
+    clause. Chars are converted to a token estimate (÷4) here since the
+    canonical columns are tokens_before/tokens_after, not char counts.
+    """
     try:
         _secure_db_permissions()
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS compressions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                method TEXT,
-                original_chars INTEGER,
-                compressed_chars INTEGER,
-                savings_pct REAL,
-                source TEXT
+                session_id TEXT,
+                compressor TEXT,
+                tokens_before INTEGER,
+                tokens_after INTEGER,
+                compressed_at TEXT,
+                source TEXT DEFAULT 'mcp-server'
             )
         """)
+        tokens_before = max(1, original_chars // 4)
+        tokens_after = max(1, compressed_chars // 4)
         conn.execute(
-            "INSERT INTO compressions (timestamp, method, original_chars, compressed_chars, savings_pct, source) VALUES (?,?,?,?,?,?)",
-            (datetime.utcnow().isoformat(), method, original_chars, compressed_chars, savings_pct, "mcp-server"),
+            "INSERT INTO compressions (session_id, compressor, tokens_before, tokens_after, compressed_at, source) VALUES (?,?,?,?,?,?)",
+            ("mcp-server", method, tokens_before, tokens_after, datetime.utcnow().isoformat(), "mcp-server"),
         )
         conn.commit()
         conn.close()
@@ -284,27 +296,29 @@ def TrimP_stats() -> str:
     """
     try:
         conn = sqlite3.connect(str(DB_PATH))
+        # Canonical `compressions` schema (TrimP/db.py) stores tokens, not
+        # chars, and has no savings_pct column — compute it from the totals.
         rows = conn.execute("""
             SELECT
                 COUNT(*) as total_compressions,
-                SUM(original_chars) as total_original,
-                SUM(compressed_chars) as total_compressed,
-                AVG(savings_pct) as avg_savings,
-                MAX(timestamp) as last_compression
+                SUM(tokens_before) as total_before,
+                SUM(tokens_after) as total_after,
+                MAX(compressed_at) as last_compression
             FROM compressions
             WHERE source = 'mcp-server'
         """).fetchone()
         conn.close()
 
         if rows and rows[0]:
-            orig_tokens = (rows[1] or 0) // 4
-            saved_tokens = ((rows[1] or 0) - (rows[2] or 0)) // 4
+            orig_tokens = rows[1] or 0
+            saved_tokens = (rows[1] or 0) - (rows[2] or 0)
+            avg_savings = (saved_tokens / orig_tokens * 100) if orig_tokens else 0
             return json.dumps({
                 "mcp_compressions": rows[0],
                 "tokens_processed": f"{orig_tokens:,}",
                 "tokens_saved": f"{saved_tokens:,}",
-                "avg_savings_pct": f"{rows[3]:.1f}%",
-                "last_compression": rows[4],
+                "avg_savings_pct": f"{avg_savings:.1f}%",
+                "last_compression": rows[3],
                 "dashboard": "http://localhost:7432",
                 "status": "✅ TrimP MCP server active",
             }, indent=2)

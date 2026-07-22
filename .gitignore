@@ -14,6 +14,11 @@ __pycache__/
 build/
 dist/
 
+# Test coverage artifacts (pytest-cov leaves one of these per parallel worker)
+.coverage
+.coverage.*
+htmlcov/
+
 # Frontend dependencies and generated bundles
 TrimP/dashboard/frontend/node_modules/
 TrimP/dashboard/frontend/dist/
@@ -28,6 +33,11 @@ data/archives/
 *.tmp
 *.trace
 .trimp/
+
+# Stray DB created if a script is ever run from the repo root instead of
+# writing to ~/.trimp/TrimP.db or data/TrimP.db (see migrate_all_data.py,
+# import_to_correct_db.py) — real data always lives in one of those two spots.
+/TrimP.db
 
 # Unrelated nested workspaces kept locally for reference
 /FluidVoice/

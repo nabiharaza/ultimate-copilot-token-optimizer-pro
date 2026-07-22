@@ -10,6 +10,7 @@ Algorithm:
 Based on research: LongBench code understanding tasks show U-shape attention.
 """
 
+import ast
 import re
 from typing import List, Tuple
 
@@ -40,6 +41,18 @@ class CodeContextTrimmer:
         Returns:
             (compressed_text, metadata)
         """
+        deduplicated, repeated_blocks = self._deduplicate_fenced_blocks(text)
+        if repeated_blocks:
+            savings_pct = ((len(text) - len(deduplicated)) / len(text) * 100) if text else 0
+            return deduplicated, {
+                'method': 'CodeContextTrimmer',
+                'mode': 'lossless-identical-block-deduplication',
+                'repeated_blocks_removed': repeated_blocks,
+                'lines_kept': len(deduplicated.splitlines()),
+                'lines_total': len(text.splitlines()),
+                'savings_pct': round(savings_pct, 1),
+            }
+
         lines = text.split('\n')
         total_lines = len(lines)
         
@@ -84,6 +97,17 @@ class CodeContextTrimmer:
             last_idx = idx
         
         compressed = '\n'.join(result_lines)
+        mode = 'structural-line-selection'
+        try:
+            ast.parse(text)
+        except SyntaxError:
+            pass
+        else:
+            try:
+                ast.parse(compressed)
+            except SyntaxError:
+                compressed = self._python_skeleton(text)
+                mode = 'python-ast-skeleton'
         
         original_chars = len(text)
         compressed_chars = len(compressed)
@@ -94,8 +118,62 @@ class CodeContextTrimmer:
             'lines_kept': len(selected),
             'lines_total': total_lines,
             'savings_pct': round(savings_pct, 1),
-            'u_shape_applied': True
+            'u_shape_applied': True,
+            'mode': mode,
         }
+
+    @staticmethod
+    def _python_skeleton(text: str) -> str:
+        """Build a valid, explicit Python structural view from the AST."""
+        tree = ast.parse(text)
+        lines: list[str] = []
+
+        def signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+            prefix = 'async def' if isinstance(node, ast.AsyncFunctionDef) else 'def'
+            return f"{prefix} {node.name}({ast.unparse(node.args)}):"
+
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                lines.append(ast.get_source_segment(text, node) or ast.unparse(node))
+            elif isinstance(node, ast.ClassDef):
+                bases = ', '.join(ast.unparse(base) for base in node.bases)
+                lines.append(f"\nclass {node.name}({bases}):" if bases else f"\nclass {node.name}:")
+                methods = [item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                if not methods:
+                    lines.append("    pass  # TrimPy: implementation omitted from context")
+                for method in methods:
+                    lines.append("    " + signature(method))
+                    lines.append("        pass  # TrimPy: implementation omitted from context")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                lines.append("\n" + signature(node))
+                lines.append("    pass  # TrimPy: implementation omitted from context")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                segment = ast.get_source_segment(text, node)
+                if segment and len(segment) <= 240:
+                    lines.append(segment)
+        return '\n'.join(lines).strip() + '\n'
+
+    @staticmethod
+    def _deduplicate_fenced_blocks(text: str) -> Tuple[str, int]:
+        """Remove byte-identical repeated fenced snippets and retain one copy."""
+        pattern = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
+        seen: set[str] = set()
+        removed = 0
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal removed
+            block = match.group(0)
+            if block in seen:
+                removed += 1
+                return ""
+            seen.add(block)
+            return block
+
+        result = pattern.sub(replace, text)
+        if removed:
+            result = re.sub(r"\n{3,}", "\n\n", result).rstrip()
+            result += f"\n# [TrimPy: {removed} identical fenced code blocks omitted]\n"
+        return result, removed
     
     def _score_line(self, line: str, idx: int, total: int) -> float:
         """
@@ -112,7 +190,7 @@ class CodeContextTrimmer:
         # Normalize position to [0, 1]
         pos = idx / total if total > 1 else 0.5
         # U-shape: high at 0 and 1, low at 0.5
-        recency = 1 - (4 * (pos - 0.5) ** 2)  # Max=1 at ends, min=0 at middle
+        recency = 4 * (pos - 0.5) ** 2  # Max=1 at ends, min=0 at middle
         score += recency * 5  # Weight recency heavily
         
         # Structural importance

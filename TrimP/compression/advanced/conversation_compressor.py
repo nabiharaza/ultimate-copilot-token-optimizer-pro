@@ -11,6 +11,7 @@ Algorithm:
 Based on: "Lost in the Middle" paper + Anthropic's context window research + Headroom BM25.
 """
 
+import json
 import re
 from collections import Counter
 from typing import List, Dict, Tuple, Union, Any
@@ -40,7 +41,7 @@ class ConversationCompressor:
         self.use_adaptive = use_adaptive and HAS_HEADROOM
         self.bm25_scorer = BM25Scorer() if HAS_HEADROOM else None
     
-    def compress(self, messages: Union[List[Dict[str, str]], str]) -> Tuple[str, Dict[str, Any]]:
+    def compress(self, messages: Union[List[Dict[str, str]], str], *, query: str = "") -> Tuple[str, Dict[str, Any]]:
         """
         Compress a conversation history.
         
@@ -87,15 +88,17 @@ class ConversationCompressor:
         
         # Head: Summary stub
         if head_msgs:
-            summary = self._summarize_head(head_msgs)
+            summary = self._summarize_head(head_msgs, query=query)
             result.append({
-                'role': 'system',
-                'content': f'[Earlier conversation summary: {summary}]'
+                # Historical user/assistant content must never be promoted to
+                # system authority. It remains explicitly marked as data.
+                'role': 'user',
+                'content': f'[History data only: {summary}]'
             })
         
         # Mid: Extractive compression
         if mid_msgs:
-            compressed_mid = self._extract_key_content(mid_msgs)
+            compressed_mid = self._extract_key_content(mid_msgs, query=query)
             result.extend(compressed_mid)
         
         # Tail: Verbatim
@@ -113,7 +116,10 @@ class ConversationCompressor:
             'savings_pct': round(savings_pct, 1),
             'head_summarized': len(head_msgs),
             'mid_extracted': len(mid_msgs),
-            'tail_verbatim': len(tail_msgs)
+            'tail_verbatim': len(tail_msgs),
+            'query_aware': bool(query.strip()),
+            'summary_schema': 'task-state-v1',
+            'role_escalation_prevented': True,
         }
         
         # Return format based on input
@@ -121,27 +127,68 @@ class ConversationCompressor:
             return '\n'.join(m['content'] for m in result), metadata
         return result, metadata
     
-    def _summarize_head(self, messages: List[Dict[str, str]]) -> str:
-        """Create a one-line summary of early conversation."""
-        # Extract key topics using simple word frequency
-        all_text = ' '.join(m['content'] for m in messages)
-        words = re.findall(r'\b[a-zA-Z]{4,}\b', all_text.lower())
-        
-        # Count words, skip common ones
-        stopwords = {'that', 'this', 'with', 'from', 'have', 'were', 'been', 
-                     'they', 'would', 'could', 'should', 'what', 'when', 'where'}
-        word_counts = Counter(w for w in words if w not in stopwords)
-        
-        # Get top 5 topics
-        top_topics = [w for w, _ in word_counts.most_common(5)]
-        
-        # Detect user/assistant message count
-        user_msgs = sum(1 for m in messages if m['role'] == 'user')
-        
-        topics_str = ', '.join(top_topics[:3])
-        return f'{user_msgs} messages discussing {topics_str}'
+    def _summarize_head(self, messages: List[Dict[str, str]], *, query: str = "") -> str:
+        """Create an auditable task-state summary instead of a topic stub."""
+
+        goals: list[str] = []
+        decisions: list[str] = []
+        constraints: list[str] = []
+        failures: list[str] = []
+        questions: list[str] = []
+        files: list[str] = []
+        symbols: list[str] = []
+
+        def add_unique(target: list[str], value: str, limit: int) -> None:
+            value = re.sub(r"\s+", " ", value).strip()
+            if value and value not in target and len(target) < limit:
+                target.append(value[:220])
+
+        for message in messages:
+            role = str(message.get('role') or 'user')
+            content = str(message.get('content') or '')
+            files.extend(re.findall(r'(?:[\w.@+-]+/)+[\w.@+-]+(?:\.[A-Za-z0-9]{1,12})?', content))
+            symbols.extend(re.findall(r'`([^`]{2,100})`', content))
+            for sentence in self._split_sentences(content):
+                lowered = sentence.lower()
+                if re.search(r'\b(?:must|never|do not|don\'t|only|without|preserve|keep|unchanged)\b', lowered):
+                    add_unique(constraints, sentence, 5)
+                if re.search(r'\b(?:failed|failure|error|did not work|didn\'t work|blocked)\b', lowered):
+                    add_unique(failures, sentence, 4)
+                if role == 'user' and ('?' in sentence or re.search(r'\b(?:please|need|want|review|fix|build|check|implement)\b', lowered)):
+                    add_unique(goals, sentence, 4)
+                if role == 'assistant' and re.search(r'\b(?:decided|confirmed|implemented|changed|fixed|resolved|selected|recommend)\b', lowered):
+                    add_unique(decisions, sentence, 4)
+                if role == 'user' and '?' in sentence:
+                    add_unique(questions, sentence, 4)
+
+        # Keep the state schema compact enough to produce real savings. Empty
+        # fields are omitted, while hard constraints and anchors take priority.
+        state = {
+            key: value
+            for key, value in {
+                'goal': goals[:1],
+                'constraints': constraints[:3],
+                'decisions': decisions[:1],
+                'failed_attempts': failures[:2],
+                'open_questions': questions[:1],
+                'files': list(dict.fromkeys(files))[:8],
+                'symbols': list(dict.fromkeys(symbols))[:8],
+            }.items()
+            if value
+        }
+        if query:
+            state['current_query'] = query[:240]
+        encoded = json.dumps(state, ensure_ascii=False, separators=(',', ':'))
+        if len(encoded) > 260:
+            minimal = {
+                key: state[key]
+                for key in ('goal', 'constraints', 'failed_attempts', 'files', 'symbols')
+                if key in state
+            }
+            encoded = json.dumps(minimal, ensure_ascii=False, separators=(',', ':'))
+        return encoded
     
-    def _extract_key_content(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def _extract_key_content(self, messages: List[Dict[str, str]], *, query: str = "") -> List[Dict[str, str]]:
         """Extract key sentences from middle messages using BM25 (or fallback to TF-IDF)."""
         result = []
         
@@ -163,11 +210,17 @@ class ConversationCompressor:
             # Score sentences (BM25 if available, else TF-IDF)
             if self.bm25_scorer:
                 # Use BM25: score each sentence against the full message context
-                scores_list = self.bm25_scorer.score_batch(sentences, content)
+                scores_list = self.bm25_scorer.score_batch(sentences, query or content)
                 scores = [score for score, _ in scores_list]
             else:
                 # Fallback to TF-IDF
                 scores = self._score_sentences(sentences)
+                if query:
+                    query_terms = set(re.findall(r'\b[a-zA-Z_][\w.-]{2,}\b', query.lower()))
+                    scores = [
+                        score + 4.0 * len(query_terms & set(re.findall(r'\b[a-zA-Z_][\w.-]{2,}\b', sentence.lower())))
+                        for score, sentence in zip(scores, sentences)
+                    ]
             
             # Adaptive sizing or fixed 40%
             if self.use_adaptive:
@@ -233,7 +286,7 @@ class ConversationCompressor:
     def _split_sentences(self, text: str) -> List[str]:
         """Split text into sentences."""
         # Simple sentence splitting
-        sentences = re.split(r'[.!?]+\s+', text)
+        sentences = re.split(r'(?<=[.!?])\s+|\n{2,}', text)
         return [s.strip() for s in sentences if s.strip()]
     
     def _score_sentences(self, sentences: List[str]) -> List[float]:
@@ -299,7 +352,8 @@ class ConversationCompressor:
 
 def compress_conversation(messages: List[Dict[str, str]], 
                           verbatim_tail: int = 5,
-                          summary_head: int = 10) -> Tuple[List[Dict[str, str]], dict]:
+                          summary_head: int = 10,
+                          query: str = "") -> Tuple[List[Dict[str, str]], dict]:
     """
     Convenience function for conversation compression.
     
@@ -312,4 +366,4 @@ def compress_conversation(messages: List[Dict[str, str]],
         (compressed_messages, metadata)
     """
     compressor = ConversationCompressor(verbatim_tail=verbatim_tail, summary_head=summary_head)
-    return compressor.compress(messages)
+    return compressor.compress(messages, query=query)

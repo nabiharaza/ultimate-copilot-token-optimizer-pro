@@ -27,6 +27,8 @@ dependencies = [
     "humanize>=4",
     "watchfiles>=0.22",
     "psutil>=5.9",
+    "tiktoken>=0.7",
+    "llmlingua>=0.2.2",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +36,8 @@ dependencies = [
 # integration). Kept optional so the core CLI/dashboard/proxy install
 # doesn't pull it in for people who never use MCP.
 mcp = ["fastmcp>=0.2"]
+# Compatibility alias: LLMLingua-2 and its ML runtime are now core.
+ml = []
 
 [project.scripts]
 trimp = "TrimP.cli:app"

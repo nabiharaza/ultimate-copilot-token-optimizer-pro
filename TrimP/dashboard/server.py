@@ -3,24 +3,26 @@ from __future__ import annotations
 
 import json
 import hashlib
+import difflib
 import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from statistics import median
 from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 from TrimP.db import db, get_config, DB_PATH
 from TrimP.chat_optimizer import ChatPayloadOptimizer, estimate_tokens
@@ -79,6 +81,44 @@ async def _reject_cross_origin_writes(request, call_next):
             from fastapi.responses import JSONResponse
             return JSONResponse({"ok": False, "error": "Cross-origin request rejected."}, status_code=403)
     return await call_next(request)
+
+
+# ── Short TTL cache for read-heavy polling endpoints ─────────────────────────
+# The dashboard's auto-refresh (see App.jsx's REFRESH_EVENT) re-fetches charts
+# like /api/copilot/timeseries and /api/savings every second. Almost every one
+# of those ticks repeats the same query with the same params against data that
+# hasn't changed since the last poll, so each one re-running a full aggregation
+# query is wasted DB work. A ~2s TTL is short enough that the dashboard still
+# feels live (data is at most one poll cycle stale) but long enough to collapse
+# the common case of several polls in a row hitting an unchanged result.
+_CACHE_TTL_SECONDS = 2.0
+_response_cache: dict[tuple, tuple[float, Any]] = {}
+
+
+def ttl_cached(func):
+    """Cache an async read-only endpoint's return value for _CACHE_TTL_SECONDS.
+
+    Keyed on the endpoint name + its resolved arguments, so different query
+    params (range, granularity, repository, ...) get independent cache entries.
+    Only use this on endpoints with no side effects — it will happily return a
+    stale response for anything that mutates state.
+    """
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        key = (func.__name__, args, tuple(sorted(kwargs.items())))
+        now = time.monotonic()
+        cached = _response_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        result = await func(*args, **kwargs)
+        # Cheap hygiene cap: real cardinality here is bounded by (range ×
+        # granularity × repository count), but if it ever balloons, don't let
+        # a stray caller turn this into an unbounded memory leak.
+        if len(_response_cache) > 500:
+            _response_cache.clear()
+        _response_cache[key] = (now + _CACHE_TTL_SECONDS, result)
+        return result
+    return wrapper
 
 
 # Every POST/PUT body on this app is a small dict (a config value, a test
@@ -289,6 +329,49 @@ def _safe_json(value: str | None) -> dict:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def _line_change_details(original: str | None, optimized: str | None) -> dict[str, Any]:
+    """Classify line-level changes for the auditable Diff Review UI."""
+    before = str(original or "").splitlines()
+    after = str(optimized or "").splitlines()
+    entries: list[dict[str, Any]] = []
+    counts = {"removed": 0, "kept": 0, "modified": 0}
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for opcode, i1, i2, j1, j2 in matcher.get_opcodes():
+        if opcode == "equal":
+            for offset, line in enumerate(before[i1:i2]):
+                entries.append({"type": "kept", "before_line": i1 + offset + 1, "after_line": j1 + offset + 1, "before": line, "after": line})
+                counts["kept"] += 1
+        elif opcode == "delete":
+            for offset, line in enumerate(before[i1:i2]):
+                entries.append({"type": "removed", "before_line": i1 + offset + 1, "after_line": None, "before": line, "after": ""})
+                counts["removed"] += 1
+        elif opcode == "insert":
+            for offset, line in enumerate(after[j1:j2]):
+                entries.append({"type": "modified", "before_line": None, "after_line": j1 + offset + 1, "before": "", "after": line})
+                counts["modified"] += 1
+        else:
+            old_lines, new_lines = before[i1:i2], after[j1:j2]
+            paired = min(len(old_lines), len(new_lines))
+            for offset in range(paired):
+                entries.append({"type": "modified", "before_line": i1 + offset + 1, "after_line": j1 + offset + 1, "before": old_lines[offset], "after": new_lines[offset]})
+                counts["modified"] += 1
+            for offset, line in enumerate(old_lines[paired:]):
+                entries.append({"type": "removed", "before_line": i1 + paired + offset + 1, "after_line": None, "before": line, "after": ""})
+                counts["removed"] += 1
+            for offset, line in enumerate(new_lines[paired:]):
+                entries.append({"type": "modified", "before_line": None, "after_line": j1 + paired + offset + 1, "before": "", "after": line})
+                counts["modified"] += 1
+    return {"counts": counts, "entries": entries}
+
+
+def _pretty_payload(value: str | None, fallback: str | None = None) -> str:
+    text = str(value or fallback or "")
+    try:
+        return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return text
 
 
 def _clean_repository(value: object, cwd: object = "") -> str:
@@ -1071,9 +1154,34 @@ async def copilot_summary(range: str = "day", repository: str = ""):
 
 
 @app.get("/api/copilot/conversations")
-async def copilot_conversations(range: str = "day", limit: int = 100):
+async def copilot_conversations(
+    range: str = "day",
+    limit: int = 100,
+    repository: str = "",
+    date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+):
     """Detailed Copilot proxy conversations/requests with prompt and compression metadata."""
     threshold = _threshold_for_range(range)
+    filters = ["c.source='byok'", "c.compressed_at >= ?"]
+    params: list[Any] = [threshold]
+    if repository:
+        filters.append("COALESCE(s.repository, '') = ?")
+        params.append(repository)
+    if date and not start_date:
+        start_date = date
+    if start_date:
+        try:
+            selected_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            selected_end = datetime.strptime(end_date or start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="dates must use YYYY-MM-DD format")
+        if selected_end < selected_start:
+            raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
+        filters.append("c.compressed_at >= ? AND c.compressed_at < ?")
+        params.extend([selected_start.isoformat(), (selected_end + timedelta(days=1)).isoformat()])
+    params.append(max(1, min(limit, 500)))
     with db() as conn:
         rows = conn.execute(
             """SELECT c.id,
@@ -1107,10 +1215,10 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
                FROM compressions c
                LEFT JOIN sessions s ON s.id = c.session_id
                LEFT JOIN turns t ON t.id = c.turn_id
-               WHERE c.source='byok' AND c.compressed_at >= ?
+               WHERE {where_clause}
                ORDER BY c.compressed_at DESC
-               LIMIT ?""",
-            (threshold, limit),
+               LIMIT ?""".format(where_clause=" AND ".join(filters)),
+            params,
         ).fetchall()
 
     conversations = []
@@ -1164,6 +1272,33 @@ async def copilot_conversations(range: str = "day", limit: int = 100):
             item.pop(_raw_field, None)
         conversations.append(item)
     return conversations
+
+
+@app.get("/api/copilot/conversations/{conversation_id}/diff")
+async def copilot_conversation_diff(conversation_id: int):
+    """Load the full before/after payload only for the selected diff review."""
+    with db() as conn:
+        row = conn.execute(
+            """SELECT c.id, c.original_text, c.compressed_text, c.request_body,
+                      c.optimized_body, c.algorithm_details
+               FROM compressions c
+               WHERE c.id=? AND c.source='byok'""",
+            (conversation_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="review not found")
+    item = dict(row)
+    original = _pretty_payload(item.get("request_body"), item.get("original_text"))
+    optimized = _pretty_payload(item.get("optimized_body"), item.get("compressed_text"))
+    details = _safe_json(item.get("algorithm_details"))
+    changes = details.get("changes") if isinstance(details.get("changes"), list) else []
+    return {
+        "id": item["id"],
+        "original_text": original,
+        "compressed_text": optimized,
+        "changes": changes,
+        "line_changes": _line_change_details(original, optimized),
+    }
 
 
 @app.get("/api/copilot/conversations-page")
@@ -1328,6 +1463,7 @@ async def copilot_daily(days: int = 14, repository: str = ""):
 
 
 @app.get("/api/copilot/timeseries")
+@ttl_cached
 async def copilot_timeseries(range: str = "day", granularity: str = "auto", repository: str = ""):
     """Aggregate real BYOK events for the dashboard's selected time window and bucket."""
     valid_granularities = {"auto", "minute", "hour", "day", "week", "month", "year"}
@@ -1666,7 +1802,7 @@ async def compression_methods():
         {"id": "search", "name": "Search Results", "description": "Compresses grep/find results to top hits", "icon": "search", "color": "#425563"},
         {"id": "json", "name": "JSON/Tables", "description": "Minimizes JSON and tabular data", "icon": "code", "color": "#5FCBEB"},
         {"id": "skeleton", "name": "Code Skeleton", "description": "Extracts code structure (signatures, imports)", "icon": "file-code", "color": "#7630EA"},
-        {"id": "stopword", "name": "Stop Words", "description": "Removes filler words from text", "icon": "filter", "color": "#FF8300"},
+        {"id": "stopword", "name": "Stop Words (retired)", "description": "Compatibility mode; generic word deletion is disabled to preserve intent", "icon": "filter", "color": "#8894A5"},
         {"id": "prompt", "name": "Prompt Compression", "description": "Compresses system prompts and instructions", "icon": "message-square", "color": "#FFB81C"},
         {"id": "code", "name": "Code Context", "description": "U-shape recency for code files (40-75% savings)", "icon": "code", "color": "#01A982"},
         {"id": "conversation", "name": "Conversation", "description": "3-tier chat compression (50-70% savings)", "icon": "message-circle", "color": "#425563"},
@@ -1712,6 +1848,7 @@ async def session_checkpoints(session_id: str):
 
 
 @app.get("/api/savings")
+@ttl_cached
 async def global_savings():
     with db() as conn:
         row = conn.execute("SELECT SUM(tokens_saved) as total FROM sessions").fetchone()
@@ -1729,6 +1866,7 @@ async def global_savings():
 
 
 @app.get("/api/trends/daily")
+@ttl_cached
 async def daily_trends(days: int = 30):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     with db() as conn:
@@ -1992,6 +2130,14 @@ async def validation_proof_report(client: str = "all", repository: str = "", ran
                LIMIT 20""",
             params,
         ).fetchall()
+        context_rows = conn.execute(
+            f"""SELECT c.algorithm_details, c.actual_usage
+                FROM compressions c
+                LEFT JOIN sessions s ON s.id = c.session_id
+                WHERE {where}
+                ORDER BY c.compressed_at DESC LIMIT 1000""",
+            params,
+        ).fetchall()
 
     validation_summary = _safe_json(latest_run["summary_json"]) if latest_run else {}
     traffic = dict(traffic or {})
@@ -1999,6 +2145,48 @@ async def validation_proof_report(client: str = "all", repository: str = "", ran
     before = int(traffic.get("tokens_before") or 0)
     saved = int(traffic.get("tokens_saved") or 0)
     savings_pct = round(saved / before * 100, 2) if before else 0.0
+    verified_requests = 0
+    exact_local_counts = 0
+    fallback_events = 0
+    security_findings = 0
+    anchor_total = 0
+    anchor_preserved = 0
+    payload_passes = 0
+    provider_cache_reads = 0
+    provider_cache_writes = 0
+    tokenizers: set[str] = set()
+    providers: dict[str, int] = {}
+    compiler_requests = 0
+    for row in context_rows:
+        usage_metrics = _actual_usage_metrics(row["actual_usage"])
+        provider_cache_reads += int(usage_metrics.get("cached_tokens") or 0)
+        provider_cache_writes += int(usage_metrics.get("cache_write_tokens") or 0)
+        details = _safe_json(row["algorithm_details"])
+        if details.get("architecture_version") != "context-compiler-v1":
+            continue
+        compiler_requests += 1
+        verifications = details.get("verification") if isinstance(details.get("verification"), list) else []
+        if verifications:
+            verified_requests += 1
+        if details.get("token_count_exact"):
+            exact_local_counts += 1
+        fallback_events += len(details.get("fallbacks") or [])
+        security_findings += int(details.get("security_findings") or 0)
+        if details.get("tokenizer"):
+            tokenizers.add(str(details["tokenizer"]))
+        provider = str((details.get("provider_plan") or {}).get("provider") or "unknown")
+        providers[provider] = providers.get(provider, 0) + 1
+        for report in verifications:
+            anchor_total += int(report.get("anchor_total") or 0)
+            anchor_preserved += int(report.get("anchor_preserved") or 0)
+            if report.get("content_type") == "request-payload" and report.get("accepted"):
+                payload_passes += 1
+    runtime_retention = round(anchor_preserved / anchor_total * 100, 2) if anchor_total else None
+    fallback_rate = (
+        round(fallback_events / max(verified_requests + fallback_events, 1) * 100, 2)
+        if compiler_requests else None
+    )
+    payload_pass_rate = round(payload_passes / verified_requests * 100, 2) if verified_requests else None
     validation_pass = validation_summary.get("verdict") == "PASS"
     context_retention = float(validation_summary.get("context_retention_pct") or 0)
     audit = float(validation_summary.get("audit_completeness_pct") or 0)
@@ -2051,6 +2239,21 @@ async def validation_proof_report(client: str = "all", repository: str = "", ran
             "latest_at": traffic.get("latest_at"),
             "paired_prompt_count": len(paired_prompts),
             "score": live_score,
+        },
+        "context_quality": {
+            "verified_requests": verified_requests,
+            "compiler_requests": compiler_requests,
+            "protected_anchor_retention_pct": runtime_retention,
+            "payload_contract_pass_pct": payload_pass_rate,
+            "fallback_events": fallback_events,
+            "fallback_rate_pct": fallback_rate,
+            "security_findings": security_findings,
+            "exact_local_count_pct": round(exact_local_counts / compiler_requests * 100, 2) if compiler_requests else 0.0,
+            "tokenizers": sorted(tokenizers),
+            "provider_mix": providers,
+            "provider_cache_read_tokens": provider_cache_reads,
+            "provider_cache_write_tokens": provider_cache_writes,
+            "note": "Local tokenizer accuracy and provider cache usage are reported separately from input-token reduction.",
         },
         "matrix": {
             "trust_score": trust_score,
@@ -2169,12 +2372,17 @@ async def test_trim(body: dict):
         "model": body.get("model") or "gpt-5-mini",
         "messages": [{"role": "user", "content": message}],
     }
-    optimized, stats = test_optimizer.optimize_body(request_body, enabled=enabled)
+    policy = str(body.get("policy") or "").lower()
+    optimizer = ChatPayloadOptimizer(policy=policy if policy in {"conservative", "balanced", "aggressive"} else None)
+    optimized, stats = optimizer.optimize_body(request_body, enabled=enabled)
     optimized_message = str(optimized.get("messages", [{}])[-1].get("content") or "")
     stopwords = {"about", "after", "before", "could", "every", "first", "from", "keep", "please", "same", "should", "that", "their", "there", "these", "this", "while", "with", "would"}
     before_words = {word for word in re.findall(r"[a-zA-Z]{5,}", message.lower()) if word not in stopwords}
     after_words = {word for word in re.findall(r"[a-zA-Z]{5,}", optimized_message.lower()) if word not in stopwords}
-    preserved = len(before_words & after_words) / len(before_words) if before_words else 1.0
+    local_word_preserved = len(before_words & after_words) / len(before_words) if before_words else 1.0
+    stats_payload = stats.as_dict()
+    protected_retention = float(stats_payload.get("protected_anchor_retention_pct") or 0) / 100.0
+    preserved = min(local_word_preserved, protected_retention) if stats_payload.get("verification") else local_word_preserved
     reduction = stats.savings_pct / 100.0
     quality_score = max(0.0, min(1.0, (preserved * 0.55) + (min(1.0, reduction * 2) * 0.45)))
     grade = "A" if quality_score >= .9 else "B" if quality_score >= .78 else "C" if quality_score >= .62 else "D"
@@ -2186,7 +2394,7 @@ async def test_trim(body: dict):
         "model": request_body["model"],
         "message": message,
         "optimized_message": optimized_message,
-        "stats": stats.as_dict(),
+        "stats": stats_payload,
         "quality": {
             "score": round(quality_score * 100, 1),
             "grade": grade,
@@ -2197,10 +2405,38 @@ async def test_trim(body: dict):
             "note": "Preflight signals from the local request transformation; model answer quality requires an upstream A/B run.",
         },
         "calculation": {
-            "estimator": "len(serialized request) / 4, minimum 1",
+            "tokenizer": stats_payload.get("tokenizer"),
+            "exact_for_serialized_input": stats_payload.get("token_count_exact"),
+            "billing_truth": "Upstream provider usage when available",
             "tokens_saved": "tokens_before - tokens_after",
             "reduction_pct": "tokens_saved / tokens_before * 100",
             "upstream_call": False,
+        },
+    }
+
+
+@app.post("/api/context/plan")
+async def context_plan(body: dict):
+    """Return the full context-compiler decision record without an upstream call."""
+    request_body = body.get("request") if isinstance(body.get("request"), dict) else body
+    if not isinstance(request_body, dict) or not request_body:
+        return {"ok": False, "error": "Provide a chat or Responses API request object."}
+    enabled = bool(body.get("enabled", True)) if "request" in body else True
+    policy = str(body.get("policy") or "").lower()
+    optimizer = ChatPayloadOptimizer(policy=policy if policy in {"conservative", "balanced", "aggressive"} else None)
+    optimized, stats = optimizer.optimize_body(request_body, enabled=enabled)
+    stats_payload = stats.as_dict()
+    return {
+        "ok": True,
+        "optimized": optimized,
+        "stats": stats_payload,
+        "decision": {
+            "accepted_changes": len(stats_payload.get("changes") or []),
+            "safe_fallbacks": len(stats_payload.get("fallbacks") or []),
+            "protected_anchor_retention_pct": stats_payload.get("protected_anchor_retention_pct"),
+            "security_findings": stats_payload.get("security_findings"),
+            "provider": (stats_payload.get("provider_plan") or {}).get("provider"),
+            "billing_note": "Local counts measure the compact serialized request; upstream usage is billing truth.",
         },
     }
 

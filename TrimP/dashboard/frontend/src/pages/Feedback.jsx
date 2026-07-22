@@ -1,8 +1,9 @@
-import { ArrowLeft, ArrowUpRight, Bug, CheckCircle2, Github, Heart, HelpCircle, Lightbulb, Linkedin, Mail, MessageSquare, Paperclip, PenLine, Send, ShieldCheck, Sparkles, Star, ThumbsUp, UserRound } from 'lucide-react'
+import { ArrowLeft, ArrowUpRight, Bug, CheckCircle2, Copy, Github, Heart, HelpCircle, Lightbulb, Linkedin, Mail, MessageSquare, Paperclip, PenLine, Send, ShieldCheck, Sparkles, Star, UserRound } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 const EMAIL = 'nabiha.raza30@gmail.com'
-const GITHUB_URL = 'https://github.com/nabiharaza'
+const GITHUB_PROFILE_URL = 'https://github.com/nabiharaza'
+const REPO_URL = 'https://github.com/nabiharaza/ultimate-copilot-token-optimizer-pro'
 const LINKEDIN_URL = 'https://www.linkedin.com/in/nabiha-raza/'
 const CATEGORIES = [
   ['Suggestion', Lightbulb],
@@ -11,13 +12,31 @@ const CATEGORIES = [
   ['Question', HelpCircle],
 ]
 
+function githubIssueUrl(category, message) {
+  const title = `[${category}] ${message.split('\n')[0].slice(0, 80)}`.trim()
+  const body = `${message}\n\n---\nFiled from the TrimPy dashboard's Help & feedback page.`
+  return `${REPO_URL}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}&labels=${category === 'Issue / Bug' ? 'bug' : ''}`
+}
+
 export default function Feedback({ onNavigate }) {
   const [message, setMessage] = useState('')
   const [files, setFiles] = useState([])
   const [sent, setSent] = useState(false)
   const [category, setCategory] = useState('Suggestion')
+  const [copied, setCopied] = useState(false)
   const remaining = Math.max(0, 1500 - message.length)
   const selectedFileNames = useMemo(() => files.map(file => file.name).join(' · '), [files])
+  const isBugReport = category === 'Issue / Bug'
+
+  function copyEmail() {
+    // mailto: links silently do nothing if the browser/OS has no registered
+    // mail client (common in sandboxed/desktop-app webviews), which is what
+    // made this "not work" — a copy-to-clipboard fallback always works.
+    navigator.clipboard?.writeText(EMAIL).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
 
   function submit(event) {
     event.preventDefault()
@@ -26,6 +45,9 @@ export default function Feedback({ onNavigate }) {
     const attachmentNote = files.length ? `\n\nPlease attach these files in your email: ${files.map(file => file.name).join(', ')}` : '\n\nScreenshots, logs, or short notes can be attached in your email composer.'
     const subject = encodeURIComponent(`TrimPy feedback: ${category}`)
     const body = encodeURIComponent(`[${category}]\n\n${message.trim()}${attachmentNote}`)
+    // Issue/Bug reports also open a prefilled GitHub issue — mailto alone
+    // isn't reliable (see copyEmail above) and bugs belong in the tracker.
+    if (isBugReport) window.open(githubIssueUrl(category, message.trim()), '_blank', 'noopener')
     window.location.href = `mailto:${EMAIL}?subject=${subject}&body=${body}`
     setSent(true)
   }
@@ -57,15 +79,32 @@ export default function Feedback({ onNavigate }) {
           </label>
           {files.length > 0 && <small className="feedback-file-list">{selectedFileNames}</small>}
 
+          {isBugReport && <p className="feedback-bug-note"><Github size={14} /> Bug reports also open a prefilled GitHub issue against the TrimPy repo when you send this.</p>}
+
           <div className="feedback-followup">
             <label><input type="checkbox" checked readOnly /> <span>You can contact me by email for follow-up</span></label>
-            <a href={`mailto:${EMAIL}`}><span>{EMAIL}</span><PenLine size={14} /></a>
+            <span className="feedback-email-row">
+              <a href={`mailto:${EMAIL}`}><span>{EMAIL}</span><PenLine size={14} /></a>
+              <button type="button" className="feedback-copy-email" onClick={copyEmail} title="Copy email address">
+                {copied ? <CheckCircle2 size={14} /> : <Copy size={14} />}
+                <span>{copied ? 'Copied' : 'Copy'}</span>
+              </button>
+            </span>
           </div>
 
-          {sent && <div className="feedback-success"><CheckCircle2 size={18} /><span>Your feedback was saved locally and your email composer was opened.</span></div>}
+          {sent && (
+            <div className="feedback-success">
+              <CheckCircle2 size={18} />
+              <span>
+                Your feedback was saved locally{isBugReport ? ', a GitHub issue tab was opened,' : ''} and your email composer was opened.
+                {' '}If nothing opened (some browsers block mailto without a configured mail app), use the copy button above or{' '}
+                <a href={REPO_URL} target="_blank" rel="noreferrer">open an issue on GitHub</a> directly.
+              </span>
+            </div>
+          )}
 
           <div className="feedback-submit-row">
-            <button className="feedback-submit" type="submit" disabled={!message.trim()}><Send size={16} /> Send feedback</button>
+            <button className="feedback-submit" type="submit" disabled={!message.trim()}><Send size={16} /> {isBugReport ? 'Send + open GitHub issue' : 'Send feedback'}</button>
             <span>We typically respond within 2-3 business days.</span>
           </div>
         </form>
@@ -87,11 +126,11 @@ export default function Feedback({ onNavigate }) {
     <section className="feedback-connect-grid">
       <article>
         <span className="feedback-connect-icon"><UserRound size={20} /></span>
-        <div><h3>Connect with me</h3><p>I would love to chat about ideas, feedback, or anything TrimPy.</p><div className="feedback-socials"><a href={LINKEDIN_URL} target="_blank" rel="noreferrer" aria-label="LinkedIn"><Linkedin size={22} /></a><a href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="GitHub"><Github size={22} /></a><a href={`mailto:${EMAIL}`} aria-label="Email"><Mail size={22} /></a></div><b>Let's build better tools together.</b></div>
+        <div><h3>Connect with me</h3><p>I would love to chat about ideas, feedback, or anything TrimPy.</p><div className="feedback-socials"><a href={LINKEDIN_URL} target="_blank" rel="noreferrer" aria-label="LinkedIn"><Linkedin size={22} /></a><a href={GITHUB_PROFILE_URL} target="_blank" rel="noreferrer" aria-label="GitHub"><Github size={22} /></a><a href={`mailto:${EMAIL}`} aria-label="Email"><Mail size={22} /></a></div><b>Let's build better tools together.</b></div>
       </article>
       <article>
-        <span className="feedback-connect-icon"><ThumbsUp size={20} /></span>
-        <div><h3>Like TrimPy?</h3><p>If TrimPy helps you save tokens and money, show some love.</p><div className="feedback-action-row"><a href={GITHUB_URL} target="_blank" rel="noreferrer"><Github size={16} /> Star on GitHub</a><a href={GITHUB_URL} target="_blank" rel="noreferrer"><ThumbsUp size={16} /> Like this repo</a></div><small>It motivates me a lot.</small></div>
+        <span className="feedback-connect-icon"><Bug size={20} /></span>
+        <div><h3>Found a bug, or like TrimPy?</h3><p>Report issues straight to the tracker, or star the repo to show support.</p><div className="feedback-action-row"><a href={`${REPO_URL}/issues/new`} target="_blank" rel="noreferrer"><Bug size={16} /> Open a GitHub issue</a><a href={REPO_URL} target="_blank" rel="noreferrer"><Star size={16} /> Star on GitHub</a></div><small>Fastest way to get a bug tracked.</small></div>
       </article>
       <article>
         <span className="feedback-connect-icon"><Star size={20} /></span>

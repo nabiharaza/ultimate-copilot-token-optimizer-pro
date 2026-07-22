@@ -350,22 +350,39 @@ def handle_session_start():
     
     session_id = _session_id(payload)
 
-    # Ensure DB exists
+    # Ensure DB exists. Must match the canonical `sessions` schema from
+    # TrimP/db.py (id TEXT PRIMARY KEY, started_at, ended_at, cwd,
+    # repository, ...) — the dashboard/CLI almost always create that schema
+    # before this hook ever runs, so a mismatched local CREATE TABLE was a
+    # no-op and this INSERT previously failed on "no such column:
+    # session_id", silently swallowed below. `id` is the session's primary
+    # key in the real schema, not a separate `session_id` column.
     try:
         _secure_db_permissions()
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT UNIQUE,
-                started_at TEXT,
-                last_activity TEXT
+                id          TEXT PRIMARY KEY,
+                started_at  TEXT NOT NULL,
+                ended_at    TEXT,
+                cwd         TEXT,
+                repository  TEXT,
+                branch      TEXT,
+                total_tokens_in  INTEGER DEFAULT 0,
+                total_tokens_out INTEGER DEFAULT 0,
+                tokens_saved     INTEGER DEFAULT 0,
+                quality_grade    TEXT DEFAULT 'F',
+                model            TEXT,
+                status      TEXT DEFAULT 'active',
+                label TEXT
             )
         """)
+        now = datetime.utcnow().isoformat()
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, started_at, last_activity) VALUES (?,?,?)",
-            (session_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()),
+            "INSERT OR IGNORE INTO sessions (id, started_at, status, label) VALUES (?,?,?,?)",
+            (session_id, now, "active", "claude-code"),
         )
+        conn.execute("UPDATE sessions SET ended_at = ? WHERE id = ?", (now, session_id))
         conn.commit()
         conn.close()
     except Exception:

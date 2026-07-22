@@ -15,19 +15,28 @@ import re
 from typing import List, Dict, Tuple
 from collections import Counter
 
+# Precompiled once — used to remove dates/times/numbers when deduplicating,
+# on the same per-line hot path as LEVEL_PATTERNS below.
+_DATE_PATTERN = re.compile(r'\d{4}-\d{2}-\d{2}')
+_TIME_PATTERN = re.compile(r'\d{2}:\d{2}:\d{2}')
+_NUMBER_PATTERN = re.compile(r'\b\d+\b')
+_EXTRA_WHITESPACE = re.compile(r'\s+')
+
 
 class LogExtractor:
     """Extract critical information from log files."""
-    
-    # Log level patterns (order matters: most specific first)
+
+    # Log level patterns (order matters: most specific first). Compiled once
+    # per pattern with IGNORECASE baked in, since _classify_line runs every
+    # pattern against every line of the log — the hottest loop in this module.
     LEVEL_PATTERNS = [
-        (r'\b(ERROR|FATAL|CRITICAL|Exception|Error|Failed|Failure)\b', 'ERROR', 100),
-        (r'\b(WARN|WARNING|Deprecated)\b', 'WARN', 50),
-        (r'\b(INFO|Information)\b', 'INFO', 10),
-        (r'\b(DEBUG|VERBOSE)\b', 'DEBUG', 5),
-        (r'\b(TRACE|FINE|FINEST)\b', 'TRACE', 1),
+        (re.compile(r'\b(ERROR|FATAL|CRITICAL|Exception|Error|Failed|Failure)\b', re.IGNORECASE), 'ERROR', 100),
+        (re.compile(r'\b(WARN|WARNING|Deprecated)\b', re.IGNORECASE), 'WARN', 50),
+        (re.compile(r'\b(INFO|Information)\b', re.IGNORECASE), 'INFO', 10),
+        (re.compile(r'\b(DEBUG|VERBOSE)\b', re.IGNORECASE), 'DEBUG', 5),
+        (re.compile(r'\b(TRACE|FINE|FINEST)\b', re.IGNORECASE), 'TRACE', 1),
     ]
-    
+
     def __init__(self, context_lines: int = 2, target_ratio: float = 0.3):
         """
         Args:
@@ -127,7 +136,7 @@ class LogExtractor:
     def _classify_line(self, line: str) -> Tuple[str, int]:
         """Classify a log line by level and priority."""
         for pattern, level, priority in self.LEVEL_PATTERNS:
-            if re.search(pattern, line, re.IGNORECASE):
+            if pattern.search(line):
                 return level, priority
         
         # Default: unknown/info
@@ -140,10 +149,10 @@ class LogExtractor:
         
         for c in classified:
             # Extract message (remove timestamps, numbers)
-            normalized = re.sub(r'\d{4}-\d{2}-\d{2}', '', c['line'])  # Remove dates
-            normalized = re.sub(r'\d{2}:\d{2}:\d{2}', '', normalized)  # Remove times
-            normalized = re.sub(r'\b\d+\b', 'N', normalized)  # Replace numbers
-            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            normalized = _DATE_PATTERN.sub('', c['line'])  # Remove dates
+            normalized = _TIME_PATTERN.sub('', normalized)  # Remove times
+            normalized = _NUMBER_PATTERN.sub('N', normalized)  # Replace numbers
+            normalized = _EXTRA_WHITESPACE.sub(' ', normalized).strip()
             
             if normalized in seen:
                 # Duplicate, update count

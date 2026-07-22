@@ -34,8 +34,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if output:
         compressed, saved = BashCompressor().compress(output, use_algo=False)
-        before = max(1, len(output) // 4)
-        after = max(1, len(compressed) // 4)
+        from TrimP.tokenization import count_tokens
+        before = count_tokens(output).tokens
+        after = count_tokens(compressed).tokens
         if saved > 0 and after < before:
             print(
                 f"[TrimP compressed command output: ~{before} -> ~{after} tokens, saved ~{before - after}]"

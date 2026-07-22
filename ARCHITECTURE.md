@@ -1,5 +1,15 @@
 # TrimP Architecture
 
+> The request optimization path now uses the evidence-preserving context
+> compiler documented in [docs/CONTEXT_COMPILER.md](docs/CONTEXT_COMPILER.md).
+> The legacy component inventory below remains useful for the CLI, database,
+> and non-chat compressors.
+
+For the current end-to-end runtime, request sequence, trust boundaries, failure
+paths, and observability contract, use the [Architecture Guide](docs/ARCHITECTURE_GUIDE.md).
+Implementation details live in the [Developer Guide](docs/DEVELOPER_GUIDE.md),
+and operator procedures live in the [User Guide](docs/USER_GUIDE.md).
+
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         USER INTERACTION                             │
